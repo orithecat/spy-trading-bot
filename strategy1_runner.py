@@ -48,6 +48,7 @@ class Strategy1Runner:
         self._order_coordinator = None
         self._order_account_id = None
         self._account_positions_reconciled = False
+        self._account_snapshot_unavailable = False
         self._lock = threading.RLock()
         self._emergency_liquidation_lock = threading.Lock()
         self._thread = None
@@ -254,6 +255,10 @@ class Strategy1Runner:
             market = {"entry_data_valid": False}
 
         account_snapshot = self.account_monitor.get_snapshot()
+        self._account_snapshot_unavailable = (
+            not isinstance(account_snapshot, dict)
+            or account_snapshot.get("account_data") is None
+        )
         coordinator = self._ensure_order_coordinator(account_snapshot)
         if coordinator is not None:
             try:
@@ -1212,14 +1217,10 @@ class Strategy1Runner:
             # a fresh attempt for the remaining quantity after rejection.
             if position is None:
                 return
-            if not self._account_positions_reconciled:
-                self._set_message(
-                    f"{direction}: automatic exit is paused until account position quantity is reconciled."
-                )
-                return
             coordinator = self._order_coordinator
             if coordinator is None:
                 return
+
             position_key = position.get("entry_client_order_id")
             contract = {
                 "symbol": position.get("symbol"),
@@ -1228,6 +1229,72 @@ class Strategy1Runner:
                 "option_type": position.get("option_type", direction),
             }
             quantity = int(position["quantity"])
+
+            if not self._account_positions_reconciled:
+                # A missing account snapshot is not the same as a confirmed
+                # position mismatch. During a monitor outage, permit an exit
+                # only when the durable local ledger independently proves the
+                # exact contract and remaining filled quantity.
+                if not self._account_snapshot_unavailable:
+                    self._set_message(
+                        f"{direction}: automatic exit is paused because account positions conflict with the order ledger."
+                    )
+                    return
+
+                try:
+                    if coordinator.has_unknown_order():
+                        raise ValueError("Unknown order state")
+
+                    ledger_orders = coordinator.orders()
+                    entry = next(
+                        (
+                            order for order in ledger_orders
+                            if order.get("client_order_id") == position_key
+                            and order.get("role") == "ENTRY"
+                        ),
+                        None,
+                    )
+                    if entry is None:
+                        raise ValueError("Confirmed entry is missing")
+
+                    entry_contract = entry.get("contract", {})
+                    if self._contract_identity(entry_contract) != self._contract_identity(contract):
+                        raise ValueError("Entry contract identity mismatch")
+
+                    entry_filled = int(entry.get("filled_quantity", 0) or 0)
+                    if entry_filled <= 0 or entry.get("status") not in (
+                        "FILLED", "PARTIALLY_FILLED"
+                    ):
+                        raise ValueError("Entry fill is not confirmed")
+
+                    related_exits = [
+                        order for order in ledger_orders
+                        if order.get("role") == "EXIT"
+                        and order.get("position_key") == position_key
+                    ]
+                    if any(
+                        order.get("status") in (
+                            "SUBMITTING", "PENDING", "SUBMITTED",
+                            "ACCEPTED", "PARTIALLY_FILLED", "UNKNOWN"
+                        )
+                        for order in related_exits
+                    ):
+                        # Existing active/unknown exit already covers exposure.
+                        return
+
+                    confirmed_exits = sum(
+                        int(order.get("filled_quantity", 0) or 0)
+                        for order in related_exits
+                    )
+                    ledger_remaining = entry_filled - confirmed_exits
+                    if ledger_remaining <= 0 or ledger_remaining != quantity:
+                        raise ValueError("Ledger remaining quantity mismatch")
+
+                except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
+                    self._set_message(
+                        f"{direction}: exit remains blocked because the confirmed order ledger cannot prove the remaining position."
+                    )
+                    return
         try:
             record = coordinator.submit_exit(
                 position_key=position_key,
