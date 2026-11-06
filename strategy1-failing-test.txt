@@ -1,0 +1,48 @@
+1207-                max_trade_amount=500, allocated_amount=0, option_buying_power=50,
+1208-                take_profit_pct=5, stop_loss_pct=5,
+1209-            )
+1210-        self.assertEqual(self.coordinator.submit_calls, [])
+1211-
+1212:    def test_account_monitor_failure_does_not_stop_existing_live_exit_management(self):
+1213-        self.account_monitor.allowed = False
+1214-        self.account_monitor.account_data.positions = (SimpleNamespace(symbol="SPY", instrument_type="OPTION", currency="USD", quantity=Decimal("1"), option_strategy="SINGLE", legs=(SimpleNamespace(symbol="SPY", quantity=Decimal("1"), option_type="PUT", expiration_date="2026-11-05", exercise_price=Decimal("759")),)),)
+1215-        self.runner._order_coordinator = self.coordinator
+1216-        self.runner._order_account_id = "OFFLINE-MARGIN"
+1217-        self.coordinator._orders.append({
+1218-            "client_order_id": "entry-put", "order_id": "entry-order-put",
+1219-            "signal_key": "signal-put", "position_key": "entry-put",
+1220-            "role": "ENTRY", "direction": "PUT",
+1221-            "contract": {"symbol": "SPY261105P00759000", "strike": "759",
+1222-                         "expiry": "2026-11-05", "option_type": "PUT"},
+1223-            "quantity": 1, "filled_quantity": 1, "filled_price": "2.00",
+1224-            "limit_price": "2.10", "status": "FILLED",
+1225-            "take_profit_pct": 5, "stop_loss_pct": 5,
+1226-        })
+1227-        self.account_monitor.account_data.positions = (
+1228-            self.account_option_position(1, direction="PUT"),
+1229-        )
+1230-        self.runner._sync_live_positions(self.coordinator)
+1231-        self.runner._engine = Mock()
+1232-        self.runner._engine.get_market_snapshot.return_value = {"entry_data_valid": True}
+1233-        self.runner._engine.get_option_snapshot.return_value = {
+1234-            "bid": 1.90, "ask": 1.95, "quote_valid": True,
+1235-        }
+1236-        self.runner._accept_entries = True
+1237-
+1238-        self.runner.run_once()
+1239-
+1240-        self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+1241-        self.assertIsNone(self.runner.positions["PUT"])
+1242-        self.runner._engine.get_nearest_otm_option_snapshot.assert_not_called()
+1243-
+1244-    def test_ordinary_stop_keeps_managing_open_live_position(self):
+1245-        self.runner.positions["CALL"] = {"symbol": self.contract["symbol"]}
+1246-        self.runner._worker_active = True
+1247-        self.runner._accept_entries = True
+1248-        self.runner.stop_new_entries()
+1249-        self.assertFalse(self.runner._accept_entries)
+1250-        self.assertTrue(self.runner._worker_active)
+1251-
+1252-
+1253-if __name__ == "__main__":
+1254-    unittest.main()
