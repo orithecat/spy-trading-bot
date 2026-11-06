@@ -1211,6 +1211,7 @@ class TestStrategy1Runner(unittest.TestCase):
 
     def test_account_monitor_failure_does_not_stop_existing_live_exit_management(self):
         self.account_monitor.allowed = False
+        self.account_monitor.account_data.positions = (SimpleNamespace(symbol="SPY", instrument_type="OPTION", currency="USD", quantity=Decimal("1"), option_strategy="SINGLE", legs=(SimpleNamespace(symbol="SPY", quantity=Decimal("1"), option_type="PUT", expiration_date="2026-11-05", exercise_price=Decimal("759")),)),)
         self.runner._order_coordinator = self.coordinator
         self.runner._order_account_id = "OFFLINE-MARGIN"
         self.coordinator._orders.append({
