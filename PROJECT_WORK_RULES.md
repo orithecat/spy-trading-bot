@@ -121,3 +121,13 @@ GitHub 是持续审查和同步的重要依据，但必须确认分支和提交�
 - 只有需要用户本地执行修改、测试、提交或推送等操作时，才提供相应 COMMAND。命令应让用户返回执行状态、错误信息或测试结果，不得要求用户提供源码。
 - 如果无法直接访问 GitHub 或无法执行某项操作，必须明确说明限制和未完成事项，不得假装已经读取、修改或验证。
 - 用户再次发送 READ 或纠正指令时，优先解决指令理解和行为偏差，不要擅自转回代码诊断或要求用户执行其他操作。
+
+
+## GitHub Source of Truth and Mandatory Publishing
+
+- GitHub `origin/main` is the single source of truth for project code and project rules.
+- Before proposing or making any code change, read the latest relevant files directly from GitHub `origin/main`. Never assume local code matches GitHub without verification.
+- After every code modification, publish the changed files to GitHub `origin/main`. Do not leave completed code changes only on the local machine.
+- Run the relevant validation and tests before publishing. Report any failures honestly; never claim a change is verified when tests have not passed.
+- After every push, read the changed files directly from GitHub again and verify that the uploaded content matches the intended changes.
+- Commit and push only the intended project files. Never accidentally include user data, logs, backups, credentials, or unrelated untracked files.
