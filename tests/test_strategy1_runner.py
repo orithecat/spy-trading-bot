@@ -209,6 +209,7 @@ class FakeAccountMonitor:
         self.account_data = SimpleNamespace(
             account_id="OFFLINE-MARGIN",
             account_type="MARGIN",
+            positions_complete=True,
             option_buying_power=10000,
             positions=positions,
         )
