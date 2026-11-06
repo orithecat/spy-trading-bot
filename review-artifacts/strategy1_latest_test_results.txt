@@ -184,6 +184,8 @@ AssertionError: 'ENTRY' != 'EXIT'
 
 
 ----------------------------------------------------------------------
-Ran 32 tests in 2.039s
+Ran 32 tests in 2.037s
 
 FAILED (failures=11, errors=4)
+
+TEST EXIT CODE: 1
