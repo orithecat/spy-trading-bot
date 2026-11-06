@@ -1,0 +1,763 @@
+STRATEGY 1 PATCH CONTEXT V3
+
+===== tests/test_strategy1_runner.py:14-198 [FakeCoordinator] =====
+class FakeCoordinator:
+    def __init__(self, *_args, **_kwargs):
+        self._orders = []
+        self.submit_calls = []
+        self.cancel_calls = []
+        self.exit_calls = []
+        self.broker_open_orders = []
+        self.confirmed_orders = {}
+        self.emergency_baselines = {}
+        self.cancel_external_calls = []
+        self.external_entry_states = []
+        self.reconciliation_states = {}
+        self.external_cancel_results = {}
+
+    def orders(self):
+        return [dict(order) for order in self._orders]
+
+    def active_orders(self, role=None):
+        terminal = {"FILLED", "CANCELLED", "REJECTED"}
+        return [dict(order) for order in self._orders
+                if order["status"] not in terminal and (role is None or order["role"] == role)]
+
+    def refresh_active(self):
+        return []
+
+    def has_unknown_order(self):
+        return any(order["status"] == "UNKNOWN" for order in self._orders)
+
+    def submit_entry(self, *, signal_key, contract, direction, price,
+                     max_trade_amount, allocated_amount, option_buying_power,
+                     take_profit_pct, stop_loss_pct):
+        quantity = min(
+            int((float(max_trade_amount) - float(allocated_amount)) // (float(price) * 100)),
+            int(float(option_buying_power) // (float(price) * 100)),
+        )
+        if quantity < 1:
+            raise ValueError("budget insufficient")
+        self.submit_calls.append((signal_key, contract, direction, price))
+        order = {
+            "client_order_id": f"entry-{len(self.submit_calls)}",
+            "order_id": f"order-{len(self.submit_calls)}",
+            "signal_key": signal_key,
+            "position_key": f"entry-{len(self.submit_calls)}",
+            "role": "ENTRY",
+            "direction": direction,
+            "contract": {
+                "symbol": contract["symbol"],
+                "strike": str(contract.get("strike_price", contract.get("strike"))),
+                "expiry": contract.get("expiration_date", contract.get("expiry")),
+                "option_type": direction,
+            },
+            "quantity": quantity,
+            "filled_quantity": quantity,
+            "filled_price": str(float(price) - 0.02),
+            "limit_price": str(price),
+            "status": "FILLED",
+            "take_profit_pct": take_profit_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "created_at": "2026-11-05T18:00:00+00:00",
+        }
+        self._orders.append(order)
+        return dict(order)
+
+    def list_open_orders(self):
+        return [dict(order) for order in self.broker_open_orders]
+
+    def confirm_order(self, client_order_id):
+        return dict(self.confirmed_orders[client_order_id])
+
+    def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        entry_filled = 0
+        exit_filled = 0
+        for order in self._orders:
+            contract = order.get("contract", {})
+            identity = (
+                str(contract.get("underlying_symbol", "SPY")).upper(),
+                Decimal(str(contract.get("strike"))).normalize(),
+                str(contract.get("expiry")),
+                str(contract.get("option_type", "")).upper(),
+            )
+            expected = (
+                str(contract_key[0]).upper(), Decimal(str(contract_key[1])).normalize(),
+                str(contract_key[2]), str(contract_key[3]).upper(),
+            )
+            if identity == expected:
+                if order.get("role") == "ENTRY":
+                    entry_filled += int(order.get("filled_quantity", 0))
+                elif order.get("role") == "EXIT":
+                    exit_filled += int(order.get("filled_quantity", 0))
+        return self.emergency_baselines.setdefault(
+            key, {"quantity": quantity, "entry_filled": entry_filled,
+                  "exit_filled": exit_filled,
+                  "ledger_open_quantity": entry_filled - exit_filled,
+                  "external_exit_fills": {}}
+        )
+
+    def record_emergency_external_entry(self, open_order, detail):
+        record = dict(open_order)
+        record.update(detail)
+        self.external_entry_states.append(record)
+        if record.get("legs"):
+            leg = record["legs"][0]
+            self._orders.append({
+                "client_order_id": record["client_order_id"],
+                "role": "ENTRY", "direction": leg["option_type"],
+                "contract": {
+                    "underlying_symbol": record.get("symbol", leg.get("symbol", "SPY")),
+                    "strike": leg["strike_price"],
+                    "expiry": leg["option_expire_date"],
+                    "option_type": leg["option_type"],
+                },
+                "quantity": int(record.get("total_quantity", record.get("quantity", 1))),
+                "filled_quantity": int(record.get("filled_quantity", 0)),
+                "filled_price": record.get("filled_price"),
+                "status": record["status"],
+                "cancelled_quantity": int(record.get("quantity", 1)) - int(record.get("filled_quantity", 0))
+                    if record["status"] in ("CANCELLED", "CANCELED") else 0,
+                "unresolved_quantity": 0,
+            })
+        return record
+
+    def record_emergency_reconciliation(self, contract_key, values, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        self.reconciliation_states[key] = dict(values)
+
+    def record_emergency_external_fill(self, contract_key, client_order_id,
+                                       filled_quantity, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        baseline = self.emergency_baselines[key]
+        fills = baseline.setdefault("external_exit_fills", {})
+        fills[client_order_id] = max(fills.get(client_order_id, 0), filled_quantity)
+
+    def cancel_external(self, client_order_id):
+        self.cancel_external_calls.append(client_order_id)
+        self.broker_open_orders = [
+            order for order in self.broker_open_orders
+            if order.get("client_order_id") != client_order_id
+        ]
+        return self.external_cancel_results.get(
+            client_order_id,
+            {"client_order_id": client_order_id, "status": "CANCELLED"},
+        )
+
+    def submit_exit(self, *, position_key, contract, direction, quantity, price=None,
+                    underlying_symbol=None, source="strategy1",
+                    emergency_baseline_quantity=None, broker_covered_quantity=0):
+        self.exit_calls.append({
+            "position_key": position_key, "contract": contract,
+            "direction": direction, "quantity": quantity, "price": price,
+            "underlying_symbol": underlying_symbol, "source": source,
+            "request": {
+                "instrument_type": "OPTION", "option_strategy": "SINGLE",
+                "side": "SELL", "position_intent": "SELL_TO_CLOSE",
+                "order_type": "MARKET", "time_in_force": "DAY",
+                "entrust_type": "QTY", "support_trading_session": "CORE",
+                "quantity": str(quantity),
+            },
+        })
+        order = {
+            "client_order_id": f"exit-{len(self._orders)}",
+            "order_id": f"exit-order-{len(self._orders)}",
+            "position_key": position_key,
+            "role": "EXIT",
+            "direction": direction,
+            "quantity": quantity,
+            "filled_quantity": quantity,
+            "filled_price": "1.25",
+            "limit_price": None,
+            "order_type": "MARKET",
+            "request": dict(self.exit_calls[-1]["request"]),
+            "source": source,
+            "emergency_baseline_quantity": emergency_baseline_quantity,
+            "contract": {**contract, "underlying_symbol": underlying_symbol or "SPY"},
+            "status": "FILLED",
+        }
+        self._orders.append(order)
+        return dict(order)
+
+    def cancel(self, client_order_id):
+        self.cancel_calls.append(client_order_id)
+        for order in self._orders:
+            if order["client_order_id"] == client_order_id:
+                order["status"] = "CANCELLED"
+                return dict(order)
+
+===== tests/test_strategy1_runner.py:460-472 [test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders] =====
+    def test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = ()
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertTrue(self.runner._emergency_account_flat)
+        self.assertEqual(self.runner._emergency_unresolved, [])
+
+===== tests/test_strategy1_runner.py:521-543 [test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh] =====
+    def test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "open-buy", "side": "BUY",
+            "position_intent": "BUY_TO_OPEN", "status": "SUBMITTED",
+        }]
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.cancel_external_calls, ["open-buy"])
+        self.assertEqual(self.coordinator.exit_calls, [])
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+
+===== tests/test_strategy1_runner.py:545-584 [test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger] =====
+    def test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "cancel-race"
+        open_buy = {
+            "client_order_id": "external-buy-partial", "symbol": "SPY",
+            "side": "BUY", "position_intent": "BUY_TO_OPEN",
+            "quantity": "2", "status": "SUBMITTED",
+            "legs": [{
+                "symbol": "SPY", "side": "BUY", "quantity": "2",
+                "strike_price": "761", "option_expire_date": "2026-11-05",
+                "option_type": "CALL", "instrument_type": "OPTION",
+            }],
+        }
+        self.coordinator.broker_open_orders = [open_buy]
+        self.coordinator.external_cancel_results["external-buy-partial"] = {
+            "client_order_id": "external-buy-partial", "status": "CANCELLED",
+            "total_quantity": "2", "filled_quantity": "1", "filled_price": "2.00",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.cancel_external_calls, ["external-buy-partial"])
+        self.assertEqual(self.coordinator.external_entry_states[0]["filled_quantity"], "1")
+        self.assertEqual(self.coordinator.exit_calls, [])
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+        self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 1)
+        self.assertEqual(self.coordinator.exit_calls[0]["request"]["order_type"], "MARKET")
+        self.assertEqual(self.coordinator.exit_calls[0]["request"]["position_intent"], "SELL_TO_CLOSE")
+        self.assertNotIn("limit_price", self.coordinator.exit_calls[0]["request"])
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== tests/test_strategy1_runner.py:619-648 [test_confirmed_buy_with_empty_account_snapshot_is_not_missed] =====
+    def test_confirmed_buy_with_empty_account_snapshot_is_not_missed(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "buy-hidden-in-account-snapshot"
+        self.coordinator._orders.append({
+            "client_order_id": "confirmed-buy", "role": "ENTRY",
+            "direction": "CALL", "contract": {
+                "underlying_symbol": "SPY", "strike": "761",
+                "expiry": "2026-11-05", "option_type": "CALL",
+            },
+            "quantity": 2, "filled_quantity": 2, "filled_price": "2.00",
+            "cancelled_quantity": 0, "unresolved_quantity": 0,
+            "status": "FILLED",
+        })
+        self.account_monitor.account_data.positions = ()
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 2)
+        self.assertFalse(self.runner._emergency_account_flat)
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertTrue(self.runner._emergency_account_flat)
+
+===== tests/test_strategy1_runner.py:788-815 [test_concurrent_emergency_passes_cannot_use_the_same_position_twice] =====
+    def test_concurrent_emergency_passes_cannot_use_the_same_position_twice(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingCoordinator(FakeCoordinator):
+            def list_open_orders(inner_self):
+                entered.set()
+                release.wait(timeout=2)
+                return super(BlockingCoordinator, inner_self).list_open_orders()
+
+        coordinator = BlockingCoordinator()
+        self.runner._order_coordinator = coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        first = threading.Thread(target=self.runner._emergency_close_account_positions,
+                                 args=(self.account_monitor.get_snapshot(),
+                                       self.account_monitor.account_data, coordinator))
+        first.start()
+        self.assertTrue(entered.wait(timeout=2))
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            coordinator,
+        )
+        release.set()
+        first.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(len(coordinator.exit_calls), 1)
+
+===== tests/test_strategy1_runner.py:832-870 [test_emergency_stop_does_not_repeat_an_external_filled_sell] =====
+    def test_emergency_stop_does_not_repeat_an_external_filled_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "external-sell", "symbol": "SPY",
+            "side": "SELL", "position_intent": "SELL_TO_CLOSE",
+            "quantity": "1", "filled_quantity": "1", "status": "FILLED",
+            "legs": [{
+                "symbol": "SPY", "strike_price": "761",
+                "option_expire_date": "2026-11-05", "option_type": "CALL",
+            }],
+        }]
+        self.coordinator.confirmed_orders["external-sell"] = {
+            "client_order_id": "external-sell", "status": "FILLED",
+            "total_quantity": "1", "filled_quantity": "1",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertEqual(
+            self.coordinator.emergency_baselines[
+                f"{self.runner._emergency_id}|SPY|761|2026-11-05|CALL"
+            ]
+            ["external_exit_fills"]["external-sell"],
+            1,
+        )
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertTrue(self.runner._emergency_unresolved)
+
+===== order_execution.py:211-224 [begin_emergency_scan] =====
+    def begin_emergency_scan(self, emergency_id):
+        """Persist the account-order scan intent before listing broker orders."""
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        with self._lock:
+            current = self._emergency_scans.get(emergency_id, {})
+            self._emergency_scans[emergency_id] = {
+                "account_id": self.account_id,
+                "emergency_id": emergency_id,
+                "phase": "OPEN_ORDER_SCAN_REQUESTED",
+                "status": "UNRESOLVED",
+                "started_at": current.get("started_at") or datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
+
+===== order_execution.py:226-236 [finish_emergency_scan] =====
+    def finish_emergency_scan(self, emergency_id, *, status, phase="RECONCILED"):
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        with self._lock:
+            current = self._emergency_scans.get(emergency_id)
+            if not isinstance(current, dict) or current.get("account_id") != self.account_id:
+                raise OrderStateError("Emergency scan journal is unavailable.")
+            current["phase"] = str(phase)
+            current["status"] = str(status)
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save()
+
+===== order_execution.py:238-381 [journal_external_order] =====
+    def journal_external_order(self, open_order, *, emergency_id):
+        """Persist a discovered account order before querying or cancelling it."""
+        if not isinstance(open_order, dict):
+            raise OrderStateError("External order data is malformed.")
+        client_order_id = open_order.get("client_order_id")
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise OrderStateError("External order has no verifiable client order ID.")
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        side = str(open_order.get("side", "")).upper()
+        intent = str(open_order.get("position_intent", "")).upper()
+        role = (
+            "ENTRY" if (side, intent) == ("BUY", "BUY_TO_OPEN") else
+            "EXIT" if (side, intent) == ("SELL", "SELL_TO_CLOSE") else
+            "EXTERNAL_UNKNOWN"
+        )
+        quantity = filled = None
+        contract = None
+        try:
+            raw_quantity = open_order.get("total_quantity", open_order.get("quantity"))
+            qty_decimal = _money(raw_quantity)
+            fill_decimal = _money(open_order.get("filled_quantity", open_order.get("filled_qty", 0)))
+            if (qty_decimal != qty_decimal.to_integral_value()
+                    or fill_decimal != fill_decimal.to_integral_value()):
+                raise ValueError
+            quantity, filled = int(qty_decimal), int(fill_decimal)
+            legs = open_order.get("legs")
+            if (quantity < 1 or filled < 0 or filled > quantity
+                    or not isinstance(legs, list) or len(legs) != 1
+                    or not isinstance(legs[0], dict)):
+                raise ValueError
+            leg = legs[0]
+            strike = _money(leg.get("strike_price"))
+            expiry = leg.get("option_expire_date")
+            option_type = str(leg.get("option_type", "")).upper()
+            underlying = str(open_order.get("symbol") or leg.get("symbol") or "").upper()
+            if (strike <= 0 or not isinstance(expiry, str) or not expiry
+                    or option_type not in ("CALL", "PUT") or not underlying.isalpha()):
+                raise ValueError
+            contract = {
+                "symbol": leg.get("symbol"), "strike": format(strike, "f"),
+                "expiry": expiry, "option_type": option_type,
+                "underlying_symbol": underlying,
+            }
+        except (TypeError, ValueError, ArithmeticError):
+            role = "EXTERNAL_UNKNOWN"
+
+        with self._lock:
+            existing = self._orders.get(client_order_id)
+            if existing is not None and existing.get("source") != "emergency_external":
+                raise OrderStateError("External order conflicts with a locally journaled order.")
+            if existing is not None:
+                same_identity = (
+                    existing.get("account_id") == self.account_id
+                    and existing.get("emergency_id") == emergency_id
+                    and existing.get("side") == side
+                    and existing.get("position_intent") == intent
+                    and existing.get("quantity") == quantity
+                    and existing.get("contract") == contract
+                )
+                if not same_identity:
+                    existing["status"] = "UNKNOWN"
+                    existing["reconciliation_conflict"] = True
+                    existing["emergency_phase"] = "IDENTITY_CONFLICT"
+                    self._update_quantity_tracking(existing)
+                    self._save()
+                    raise OrderStateError("External order identity changed during reconciliation.")
+                existing["emergency_phase"] = "DISCOVERED"
+                existing["order_id"] = open_order.get("order_id") or existing.get("order_id")
+                # The broker list may be stale. Preserve the highest confirmed
+                # cumulative fill and let the detail query apply monotonic checks.
+                existing["filled_quantity"] = max(
+                    int(existing.get("filled_quantity", 0) or 0), int(filled or 0)
+                )
+                if existing.get("status") not in TERMINAL_STATUSES:
+                    existing["status"] = _normalized_status(
+                        open_order.get("status", open_order.get("order_status"))
+                    )
+                self._update_quantity_tracking(existing)
+                record = existing
+            else:
+                position_key = "external:" + client_order_id
+                if role == "EXIT" and contract is not None:
+                    identity = (
+                        contract["underlying_symbol"],
+                        _money(contract["strike"]).normalize(),
+                        contract["expiry"], contract["option_type"],
+                    )
+                    candidates = []
+                    for entry in self._orders.values():
+                        if entry.get("role") != "ENTRY":
+                            continue
+                        entry_contract = entry.get("contract", {})
+                        try:
+                            entry_identity = (
+                                str(entry_contract.get("underlying_symbol", "SPY")).upper(),
+                                _money(entry_contract.get("strike")).normalize(),
+                                str(entry_contract.get("expiry", "")),
+                                str(entry_contract.get("option_type", "")).upper(),
+                            )
+                        except ValueError:
+                            continue
+                        if entry_identity != identity:
+                            continue
+                        exits = sum(
+                            int(item.get("filled_quantity", 0) or 0)
+                            for item in self._orders.values()
+                            if item.get("role") == "EXIT"
+                            and item.get("position_key") == entry.get("client_order_id")
+                        )
+                        remaining = int(entry.get("filled_quantity", 0) or 0) - exits
+                        if remaining > 0:
+                            candidates.append(entry)
+                    if len(candidates) == 1:
+                        position_key = candidates[0].get("client_order_id")
+                record = {
+                    "client_order_id": client_order_id,
+                    "order_id": open_order.get("order_id"),
+                    "account_id": self.account_id,
+                    "emergency_id": emergency_id,
+                    "emergency_phase": "DISCOVERED",
+                    "source": "emergency_external",
+                    "signal_key": None,
+                    "position_key": position_key,
+                    "role": role,
+                    "side": side,
+                    "position_intent": intent,
+                    "direction": contract.get("option_type") if contract else None,
+                    "contract": contract or {},
+                    "quantity": quantity,
+                    "filled_quantity": filled or 0,
+                    "filled_price": None,
+                    "status": _normalized_status(
+                        open_order.get("status", open_order.get("order_status"))
+                    ) if role != "EXTERNAL_UNKNOWN" else "UNKNOWN",
+                    "reconciliation_conflict": role == "EXTERNAL_UNKNOWN",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if role == "EXTERNAL_UNKNOWN":
+                    record["status"] = "UNKNOWN"
+                self._update_quantity_tracking(record)
+                self._orders[client_order_id] = record
+            self._save()
+            return dict(record)
+
+===== order_execution.py:393-432 [refresh_emergency_orders] =====
+    def refresh_emergency_orders(self, emergency_id):
+        """Re-query every journaled external order for the active batch."""
+        with self._lock:
+            ids = [
+                order["client_order_id"] for order in self._orders.values()
+                if order.get("source") == "emergency_external"
+                and order.get("emergency_id") == emergency_id
+            ]
+        refreshed = []
+        for client_order_id in ids:
+            self._set_external_order_phase(
+                client_order_id, emergency_id, "DETAIL_QUERY_REQUESTED"
+            )
+            with self._lock:
+                record = self._orders[client_order_id]
+            try:
+                detail = _payload(self.order_api.get_order_detail(
+                    self.account_id, client_order_id
+                ))
+                item = _order_item(detail)
+                with self._lock:
+                    record = self._orders[client_order_id]
+                    if item.get("client_order_id") not in (None, client_order_id):
+                        raise OrderStateError("Order detail belongs to a different order.")
+                    self._apply_detail(record, item)
+                    record["emergency_phase"] = (
+                        "UNRESOLVED" if record.get("reconciliation_conflict")
+                        or record.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                    )
+                    self._save()
+                    refreshed.append(dict(record))
+            except Exception:
+                with self._lock:
+                    record = self._orders[client_order_id]
+                    record["status"] = "UNKNOWN"
+                    record["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                    self._update_quantity_tracking(record)
+                    self._save()
+                refreshed.append(dict(record))
+        return refreshed
+
+===== order_execution.py:440-481 [get_or_create_emergency_baseline] =====
+    def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
+        """Persist account quantity and order fills at the first emergency read."""
+        key = self._emergency_key(contract_key, emergency_id)
+        with self._lock:
+            if key in self._emergency_baselines:
+                baseline = self._emergency_baselines[key]
+                if (not isinstance(baseline, dict)
+                        or int(baseline.get("quantity", -1)) < 0
+                        or int(baseline.get("entry_filled", -1)) < 0
+                        or int(baseline.get("exit_filled", -1)) < 0):
+                    raise OrderStateError("Persisted emergency baseline is malformed.")
+                return dict(baseline)
+            identity = (
+                str(contract_key[0]).upper(), _money(contract_key[1]).normalize(),
+                str(contract_key[2]), str(contract_key[3]).upper(),
+            )
+            totals = {"ENTRY": 0, "EXIT": 0}
+            for order in self._orders.values():
+                contract = order.get("contract", {})
+                try:
+                    order_identity = (
+                        str(contract.get("underlying_symbol", "SPY")).upper(),
+                        _money(contract.get("strike")).normalize(),
+                        str(contract.get("expiry", "")),
+                        str(contract.get("option_type", "")).upper(),
+                    )
+                except ValueError:
+                    continue
+                if order_identity == identity and order.get("role") in totals:
+                    totals[order["role"]] += int(order.get("filled_quantity", 0))
+            baseline = {
+                "quantity": int(quantity),
+                "entry_filled": totals["ENTRY"],
+                "exit_filled": totals["EXIT"],
+                "ledger_open_quantity": totals["ENTRY"] - totals["EXIT"],
+                "external_exit_fills": {},
+            }
+            if baseline["quantity"] < 0:
+                raise OrderStateError("Emergency position quantity is invalid.")
+            self._emergency_baselines[key] = baseline
+            self._save()
+            return dict(baseline)
+
+===== order_execution.py:483-501 [record_emergency_reconciliation] =====
+    def record_emergency_reconciliation(self, contract_key, values, *, emergency_id):
+        """Persist auditable quantities used by the current emergency pass."""
+        key = self._emergency_key(contract_key, emergency_id)
+        if not isinstance(values, dict):
+            raise OrderStateError("Emergency reconciliation state is malformed.")
+        with self._lock:
+            baseline = self._emergency_baselines.get(key)
+            if not isinstance(baseline, dict):
+                raise OrderStateError("Emergency baseline is unavailable.")
+            allowed = {
+                "confirmed_entry_filled", "confirmed_exit_filled",
+                "confirmed_cancelled_entry_quantity", "actual_remaining_position_quantity",
+                "pending_exit_quantity", "unresolved_order_quantity",
+                "account_snapshot_quantity", "reconciliation_status",
+            }
+            if set(values) - allowed:
+                raise OrderStateError("Emergency reconciliation fields are invalid.")
+            baseline["reconciliation"] = dict(values)
+            self._save()
+
+===== order_execution.py:503-526 [record_emergency_external_fill] =====
+    def record_emergency_external_fill(self, contract_key, client_order_id,
+                                       filled_quantity, *, emergency_id):
+        """Persist a matched external SELL_TO_CLOSE fill once by order ID."""
+        key = self._emergency_key(contract_key, emergency_id)
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise OrderStateError("External closing order identity is invalid.")
+        try:
+            filled_quantity = int(filled_quantity)
+        except (TypeError, ValueError):
+            raise OrderStateError("External closing order fill is invalid.") from None
+        if filled_quantity < 0:
+            raise OrderStateError("External closing order fill is invalid.")
+        with self._lock:
+            baseline = self._emergency_baselines.get(key)
+            if not isinstance(baseline, dict):
+                raise OrderStateError("Emergency baseline is unavailable.")
+            fills = baseline.setdefault("external_exit_fills", {})
+            if not isinstance(fills, dict):
+                raise OrderStateError("Emergency external fill state is malformed.")
+            previous = fills.get(client_order_id, 0)
+            if not isinstance(previous, int) or previous < 0:
+                raise OrderStateError("Emergency external fill state is malformed.")
+            fills[client_order_id] = max(previous, filled_quantity)
+            self._save()
+
+===== order_execution.py:893-935 [cancel_external] =====
+    def cancel_external(self, client_order_id):
+        """Cancel a previously journaled external order and query its outcome."""
+        with self._lock:
+            record = self._orders.get(client_order_id)
+            if (record is None or record.get("source") != "emergency_external"
+                    or record.get("account_id") != self.account_id):
+                raise OrderStateError("External order must be journaled before cancellation.")
+            emergency_id = record.get("emergency_id")
+        self._set_external_order_phase(client_order_id, emergency_id, "CANCEL_REQUESTED")
+        try:
+            self.order_api.cancel_order(self.account_id, client_order_id)
+            phase = "CANCEL_ACKNOWLEDGED"
+        except Exception:
+            phase = "CANCEL_REQUEST_UNKNOWN"
+        self._set_external_order_phase(client_order_id, emergency_id, phase)
+        self._set_external_order_phase(client_order_id, emergency_id, "DETAIL_QUERY_REQUESTED")
+        with self._lock:
+            try:
+                payload = _payload(self.order_api.get_order_detail(
+                    self.account_id, client_order_id
+                ))
+                item = _order_item(payload)
+                if item.get("client_order_id") not in (None, client_order_id):
+                    raise OrderStateError("Order detail belongs to a different order.")
+                record = self._orders[client_order_id]
+                self._apply_detail(record, item)
+                record["emergency_phase"] = (
+                    "UNRESOLVED" if record.get("reconciliation_conflict")
+                    or record.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                )
+                self._save()
+                if record.get("status") == "UNKNOWN":
+                    raise OrderStateError("External order cancellation is unresolved.")
+                return dict(record)
+            except OrderStateError:
+                raise
+            except Exception:
+                record = self._orders[client_order_id]
+                record["status"] = "UNKNOWN"
+                record["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                self._update_quantity_tracking(record)
+                self._save()
+                raise OrderStateError("External order cancellation is unresolved.") from None
+
+===== order_execution.py:937-971 [confirm_emergency_order] =====
+    def confirm_emergency_order(self, open_order, *, emergency_id):
+        """Journal an external order before its order-detail request."""
+        record = self.journal_external_order(open_order, emergency_id=emergency_id)
+        if record.get("role") == "EXTERNAL_UNKNOWN":
+            raise OrderStateError("External order cannot be safely identified.")
+        self._set_external_order_phase(
+            record["client_order_id"], emergency_id, "DETAIL_QUERY_REQUESTED"
+        )
+        with self._lock:
+            try:
+                payload = _payload(self.order_api.get_order_detail(
+                    self.account_id, record["client_order_id"]
+                ))
+                item = _order_item(payload)
+                if item.get("client_order_id") not in (None, record["client_order_id"]):
+                    raise OrderStateError("Order detail belongs to a different order.")
+                current = self._orders[record["client_order_id"]]
+                self._apply_detail(current, item)
+                current["emergency_phase"] = (
+                    "UNRESOLVED" if current.get("reconciliation_conflict")
+                    or current.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                )
+                self._save()
+                if current.get("status") == "UNKNOWN":
+                    raise OrderStateError("External order detail is unresolved.")
+                return dict(current)
+            except OrderStateError:
+                raise
+            except Exception:
+                current = self._orders[record["client_order_id"]]
+                current["status"] = "UNKNOWN"
+                current["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                self._update_quantity_tracking(current)
+                self._save()
+                raise OrderStateError("External order detail is unresolved.") from None
