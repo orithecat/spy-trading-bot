@@ -442,10 +442,10 @@ class TestStrategy1Runner(unittest.TestCase):
         }
 
     @staticmethod
-    def account_option_position(quantity=1, direction="CALL"):
+    def account_option_position(quantity=1, direction="CALL", strike="761"):
         leg = SimpleNamespace(
             symbol="SPY", quantity=Decimal(quantity), option_type=direction,
-            expiration_date="2026-11-05", exercise_price=Decimal("761"),
+            expiration_date="2026-11-05", exercise_price=Decimal(strike),
         )
         return SimpleNamespace(
             symbol="SPY", instrument_type="OPTION", currency="USD",
@@ -1225,7 +1225,7 @@ class TestStrategy1Runner(unittest.TestCase):
             "take_profit_pct": 5, "stop_loss_pct": 5,
         })
         self.account_monitor.account_data.positions = (
-            self.account_option_position(1, direction="PUT"),
+            self.account_option_position(1, direction="PUT", strike="759"),
         )
         self.runner._sync_live_positions(self.coordinator)
         self.runner._engine = Mock()
