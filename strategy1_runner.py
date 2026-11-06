@@ -149,7 +149,7 @@ class Strategy1Runner:
             else:
                 self._emergency_id = (
                     emergency_id if isinstance(emergency_id, str) and emergency_id
-                    else None
+                    else uuid.uuid4().hex
                 )
                 self._emergency_strategy1_flat = False
                 self._emergency_account_flat = False
