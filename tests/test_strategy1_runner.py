@@ -80,6 +80,148 @@ class FakeCoordinator:
     def confirm_order(self, client_order_id):
         return dict(self.confirmed_orders[client_order_id])
 
+    def begin_emergency_scan(self, emergency_id):
+        self.emergency_scans = getattr(self, "emergency_scans", {})
+        self.emergency_scans[emergency_id] = {
+            "status": "UNRESOLVED",
+            "phase": "OPEN_ORDER_SCAN_REQUESTED",
+        }
+
+    def finish_emergency_scan(self, emergency_id, *, status, phase="RECONCILED"):
+        scans = getattr(self, "emergency_scans", {})
+        if emergency_id not in scans:
+            raise RuntimeError("Emergency scan journal is unavailable.")
+        scans[emergency_id].update({"status": status, "phase": phase})
+
+    def journal_external_order(self, open_order, *, emergency_id):
+        record = dict(open_order)
+        side = str(record.get("side", "")).upper()
+        intent = str(record.get("position_intent", "")).upper()
+        record["role"] = (
+            "ENTRY" if (side, intent) == ("BUY", "BUY_TO_OPEN")
+            else "EXIT" if (side, intent) == ("SELL", "SELL_TO_CLOSE")
+            else "EXTERNAL_UNKNOWN"
+        )
+        record["source"] = "emergency_external"
+        record["emergency_id"] = emergency_id
+        record.setdefault("filled_quantity", 0)
+        record.setdefault("quantity", record.get("total_quantity"))
+        return record
+
+    def refresh_emergency_orders(self, emergency_id):
+        return [
+            dict(order) for order in self._orders
+            if order.get("source") == "emergency_external"
+            and order.get("emergency_id") == emergency_id
+        ]
+
+    def confirm_emergency_order(self, open_order, *, emergency_id):
+        record = self.journal_external_order(
+            open_order, emergency_id=emergency_id
+        )
+        client_id = record.get("client_order_id")
+        detail = self.confirmed_orders.get(client_id)
+        if detail is not None:
+            record.update(detail)
+        return record
+
+    def begin_emergency_scan(self, emergency_id):
+        self.emergency_scans = getattr(self, "emergency_scans", {})
+        self.emergency_scans[emergency_id] = {
+            "status": "UNRESOLVED",
+            "phase": "OPEN_ORDER_SCAN_REQUESTED",
+        }
+
+    def finish_emergency_scan(self, emergency_id, *, status, phase="RECONCILED"):
+        scans = getattr(self, "emergency_scans", {})
+        if emergency_id not in scans:
+            raise RuntimeError("Emergency scan journal is unavailable.")
+        scans[emergency_id].update({"status": status, "phase": phase})
+
+    def journal_external_order(self, open_order, *, emergency_id):
+        client_id = open_order.get("client_order_id")
+        if not isinstance(client_id, str) or not client_id:
+            raise RuntimeError("External order ID is missing.")
+        side = str(open_order.get("side", "")).upper()
+        intent = str(open_order.get("position_intent", "")).upper()
+        role = (
+            "ENTRY" if (side, intent) == ("BUY", "BUY_TO_OPEN")
+            else "EXIT" if (side, intent) == ("SELL", "SELL_TO_CLOSE")
+            else "EXTERNAL_UNKNOWN"
+        )
+        legs = open_order.get("legs")
+        contract = {}
+        if isinstance(legs, list) and len(legs) == 1:
+            leg = legs[0]
+            contract = {
+                "symbol": leg.get("symbol"),
+                "underlying_symbol": str(open_order.get("symbol") or leg.get("symbol") or "").upper(),
+                "strike": str(leg.get("strike_price", "")),
+                "expiry": str(leg.get("option_expire_date", "")),
+                "option_type": str(leg.get("option_type", "")).upper(),
+            }
+        else:
+            role = "EXTERNAL_UNKNOWN"
+        if role == "EXTERNAL_UNKNOWN":
+            raise RuntimeError("External order contract is ambiguous.")
+        quantity = int(open_order.get("total_quantity", open_order.get("quantity", 0)))
+        filled = int(open_order.get("filled_quantity", open_order.get("filled_qty", 0)) or 0)
+        if quantity < 1 or filled < 0 or filled > quantity:
+            raise RuntimeError("External order quantities are invalid.")
+        existing = next(
+            (item for item in self._orders if item.get("client_order_id") == client_id),
+            None,
+        )
+        record = {
+            "client_order_id": client_id,
+            "order_id": open_order.get("order_id"),
+            "source": "emergency_external",
+            "emergency_id": emergency_id,
+            "role": role,
+            "side": side,
+            "position_intent": intent,
+            "direction": contract["option_type"],
+            "position_key": "external:" + client_id,
+            "contract": contract,
+            "quantity": quantity,
+            "filled_quantity": filled,
+            "status": str(open_order.get("status", "UNKNOWN")).upper(),
+        }
+        if existing is not None:
+            if existing.get("contract") != contract or existing.get("role") != role:
+                raise RuntimeError("External order identity changed.")
+            record["filled_quantity"] = max(
+                int(existing.get("filled_quantity", 0)),
+                filled,
+            )
+            existing.update(record)
+        else:
+            self._orders.append(record)
+        return dict(existing or record)
+
+    def refresh_emergency_orders(self, emergency_id):
+        return [
+            dict(order) for order in self._orders
+            if order.get("source") == "emergency_external"
+            and order.get("emergency_id") == emergency_id
+        ]
+
+    def confirm_emergency_order(self, open_order, *, emergency_id):
+        record = self.journal_external_order(
+            open_order, emergency_id=emergency_id
+        )
+        detail = self.confirmed_orders.get(record["client_order_id"], {})
+        existing = next(
+            item for item in self._orders
+            if item.get("client_order_id") == record["client_order_id"]
+        )
+        if detail:
+            filled = int(detail.get("filled_quantity", existing["filled_quantity"]) or 0)
+            existing["filled_quantity"] = max(existing["filled_quantity"], filled)
+            existing["status"] = str(detail.get("status", existing["status"])).upper()
+            existing["order_id"] = detail.get("order_id") or existing.get("order_id")
+        return dict(existing)
+
     def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
         key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
         entry_filled = 0
@@ -99,7 +241,8 @@ class FakeCoordinator:
             if identity == expected:
                 if order.get("role") == "ENTRY":
                     entry_filled += int(order.get("filled_quantity", 0))
-                elif order.get("role") == "EXIT":
+                elif (order.get("role") == "EXIT"
+                      and order.get("source") != "emergency_external"):
                     exit_filled += int(order.get("filled_quantity", 0))
         return self.emergency_baselines.setdefault(
             key, {"quantity": quantity, "entry_filled": entry_filled,
@@ -114,9 +257,17 @@ class FakeCoordinator:
         self.external_entry_states.append(record)
         if record.get("legs"):
             leg = record["legs"][0]
-            self._orders.append({
-                "client_order_id": record["client_order_id"],
-                "role": "ENTRY", "direction": leg["option_type"],
+            client_id = record["client_order_id"]
+            existing = next(
+                (item for item in self._orders
+                 if item.get("client_order_id") == client_id),
+                None,
+            )
+            order = {
+                "client_order_id": client_id,
+                "source": "emergency_external",
+                "role": "ENTRY",
+                "direction": leg["option_type"],
                 "contract": {
                     "underlying_symbol": record.get("symbol", leg.get("symbol", "SPY")),
                     "strike": leg["strike_price"],
@@ -126,11 +277,22 @@ class FakeCoordinator:
                 "quantity": int(record.get("total_quantity", record.get("quantity", 1))),
                 "filled_quantity": int(record.get("filled_quantity", 0)),
                 "filled_price": record.get("filled_price"),
-                "status": record["status"],
-                "cancelled_quantity": int(record.get("quantity", 1)) - int(record.get("filled_quantity", 0))
-                    if record["status"] in ("CANCELLED", "CANCELED") else 0,
+                "status": str(record["status"]).upper(),
+                "cancelled_quantity": (
+                    int(record.get("total_quantity", record.get("quantity", 1)))
+                    - int(record.get("filled_quantity", 0))
+                    if str(record["status"]).upper() == "CANCELLED" else 0
+                ),
                 "unresolved_quantity": 0,
-            })
+            }
+            if existing is not None:
+                order["filled_quantity"] = max(
+                    int(existing.get("filled_quantity", 0)),
+                    order["filled_quantity"],
+                )
+                existing.update(order)
+            else:
+                self._orders.append(order)
         return record
 
     def record_emergency_reconciliation(self, contract_key, values, *, emergency_id):
@@ -146,14 +308,28 @@ class FakeCoordinator:
 
     def cancel_external(self, client_order_id):
         self.cancel_external_calls.append(client_order_id)
-        self.broker_open_orders = [
-            order for order in self.broker_open_orders
-            if order.get("client_order_id") != client_order_id
-        ]
-        return self.external_cancel_results.get(
-            client_order_id,
-            {"client_order_id": client_order_id, "status": "CANCELLED"},
+        open_order = next(
+            (item for item in self.broker_open_orders
+             if item.get("client_order_id") == client_order_id),
+            None,
         )
+        if open_order is None:
+            raise RuntimeError("External order is not open.")
+        detail = dict(self.external_cancel_results.get(
+            client_order_id,
+            {
+                "client_order_id": client_order_id,
+                "status": "CANCELLED",
+                "total_quantity": open_order.get("total_quantity", open_order.get("quantity")),
+                "filled_quantity": open_order.get("filled_quantity", 0),
+            },
+        ))
+        self.record_emergency_external_entry(open_order, detail)
+        self.broker_open_orders = [
+            item for item in self.broker_open_orders
+            if item.get("client_order_id") != client_order_id
+        ]
+        return {**open_order, **detail}
 
     def submit_exit(self, *, position_key, contract, direction, quantity, price=None,
                     underlying_symbol=None, source="strategy1",
@@ -266,9 +442,9 @@ class TestStrategy1Runner(unittest.TestCase):
         }
 
     @staticmethod
-    def account_option_position(quantity=1):
+    def account_option_position(quantity=1, direction="CALL"):
         leg = SimpleNamespace(
-            symbol="SPY", quantity=Decimal(quantity), option_type="CALL",
+            symbol="SPY", quantity=Decimal(quantity), option_type=direction,
             expiration_date="2026-11-05", exercise_price=Decimal("761"),
         )
         return SimpleNamespace(
@@ -389,6 +565,7 @@ class TestStrategy1Runner(unittest.TestCase):
 
     def test_buy_authorization_off_does_not_disable_existing_position_exit(self):
         self.runner.real_trading_authorized = False
+        self.runner._account_positions_reconciled = True
         self.runner._order_coordinator = self.coordinator
         self.coordinator._orders.append({
             "client_order_id": "entry-call", "position_key": "entry-call",
@@ -526,8 +703,14 @@ class TestStrategy1Runner(unittest.TestCase):
         self.runner._emergency = True
         self.account_monitor.account_data.positions = (self.account_option_position(1),)
         self.coordinator.broker_open_orders = [{
-            "client_order_id": "open-buy", "side": "BUY",
-            "position_intent": "BUY_TO_OPEN", "status": "SUBMITTED",
+            "client_order_id": "open-buy", "symbol": "SPY",
+            "side": "BUY", "position_intent": "BUY_TO_OPEN",
+            "quantity": "1", "filled_quantity": "0", "status": "SUBMITTED",
+            "legs": [{
+                "symbol": "SPY", "side": "BUY", "quantity": "1",
+                "strike_price": "761", "option_expire_date": "2026-11-05",
+                "option_type": "CALL", "instrument_type": "OPTION",
+            }],
         }]
 
         self.runner._emergency_close_account_positions(
@@ -896,6 +1079,7 @@ class TestStrategy1Runner(unittest.TestCase):
     def test_take_profit_submits_real_sell_to_close_and_waits_for_fill(self, _log_event):
         self.runner._order_coordinator = self.coordinator
         self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._account_positions_reconciled = True
         self.coordinator._orders.append({
             "client_order_id": "entry-call", "order_id": "entry-order-call",
             "signal_key": "signal-call", "position_key": "entry-call",
@@ -921,6 +1105,7 @@ class TestStrategy1Runner(unittest.TestCase):
 
     def test_rejected_exit_does_not_strand_confirmed_position(self):
         self.runner._order_coordinator = self.coordinator
+        self.runner._account_positions_reconciled = True
         self.coordinator._orders.extend([
             {
                 "client_order_id": "entry-call", "position_key": "entry-call",
@@ -1038,6 +1223,9 @@ class TestStrategy1Runner(unittest.TestCase):
             "limit_price": "2.10", "status": "FILLED",
             "take_profit_pct": 5, "stop_loss_pct": 5,
         })
+        self.account_monitor.account_data.positions = (
+            self.account_option_position(1, direction="PUT"),
+        )
         self.runner._sync_live_positions(self.coordinator)
         self.runner._engine = Mock()
         self.runner._engine.get_market_snapshot.return_value = {"entry_data_valid": True}

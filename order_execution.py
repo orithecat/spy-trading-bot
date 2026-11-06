@@ -465,7 +465,9 @@ class OrderCoordinator:
                     )
                 except ValueError:
                     continue
-                if order_identity == identity and order.get("role") in totals:
+                if (order_identity == identity and order.get("role") in totals
+                        and not (order.get("role") == "EXIT"
+                                 and order.get("source") == "emergency_external")):
                     totals[order["role"]] += int(order.get("filled_quantity", 0))
             baseline = {
                 "quantity": int(quantity),

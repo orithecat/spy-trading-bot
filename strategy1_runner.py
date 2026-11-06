@@ -783,16 +783,28 @@ class Strategy1Runner:
                 int(order.get("filled_quantity", 0) or 0)
                 for order in orders if order.get("role") == "ENTRY"
             )
+            external_exit_orders = [
+                order for order in orders
+                if order.get("role") == "EXIT"
+                and order.get("source") == "emergency_external"
+                and self._contract_identity(order.get("contract", {})) == key
+            ]
+            external_exit_fills = sum(
+                int(order.get("filled_quantity", 0) or 0)
+                for order in external_exit_orders
+            )
             exit_filled = sum(
                 int(order.get("filled_quantity", 0) or 0)
-                for order in orders if order.get("role") == "EXIT"
+                for order in orders
+                if order.get("role") == "EXIT"
+                and order.get("source") != "emergency_external"
             )
             local_net = entry_filled - exit_filled
             if local_net < 0:
                 unresolved.append(f"Confirmed order fills conflict for {key[0]} option.")
                 continue
             account_quantity = account_quantities.get(key, 0)
-            baseline_seed = max(account_quantity, local_net)
+            baseline_seed = max(account_quantity, local_net, external_exit_fills)
             try:
                 baseline = coordinator.get_or_create_emergency_baseline(
                     key, baseline_seed, emergency_id=self._emergency_id
@@ -827,6 +839,37 @@ class Strategy1Runner:
                         f"The initial account quantity conflicts with prior exits for {key[0]} option."
                     )
                     continue
+                baseline = coordinator.get_or_create_emergency_baseline(
+                    key, baseline_seed, emergency_id=self._emergency_id
+                )
+                # Persist cumulative fills from discovered external SELL_TO_CLOSE
+                # orders by client order ID. The coordinator uses max(), so repeated
+                # emergency scans cannot count the same cumulative fill twice.
+                for external_order in orders:
+                    if (
+                        external_order.get("source") == "emergency_external"
+                        and external_order.get("role") == "EXIT"
+                        and self._contract_identity(
+                            external_order.get("contract", {})
+                        ) == key
+                    ):
+                        coordinator.record_emergency_external_fill(
+                            key,
+                            external_order.get("client_order_id"),
+                            external_order.get("filled_quantity", 0),
+                            emergency_id=self._emergency_id,
+                        )
+
+                baseline = coordinator.get_or_create_emergency_baseline(
+                    key, baseline_seed, emergency_id=self._emergency_id
+                )
+                for external_order in external_exit_orders:
+                    coordinator.record_emergency_external_fill(
+                        key,
+                        external_order["client_order_id"],
+                        int(external_order.get("filled_quantity", 0) or 0),
+                        emergency_id=self._emergency_id,
+                    )
                 baseline = coordinator.get_or_create_emergency_baseline(
                     key, baseline_seed, emergency_id=self._emergency_id
                 )
@@ -870,7 +913,7 @@ class Strategy1Runner:
                 for order in orders
             )
             quantity_conflict = (
-                account_quantity != expected_remaining
+                account_quantity > expected_remaining
                 or total_coverage > expected_remaining
             )
             try:
@@ -896,8 +939,8 @@ class Strategy1Runner:
 
             # A lower or higher account quantity cannot authorize a sell by
             # itself. The order-ID journal must explain the complete difference.
-            if account_quantity != expected_remaining:
-                unresolved.append(f"Account quantity conflicts with confirmed fills for {key[0]} option.")
+            if account_quantity > expected_remaining:
+                unresolved.append(f"Account quantity exceeds confirmed remaining fills for {key[0]} option.")
                 continue
             if total_coverage > expected_remaining:
                 unresolved.append(f"Closing orders exceed confirmed remaining quantity for {key[0]} option.")
