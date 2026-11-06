@@ -257,6 +257,8 @@ class TestStrategy1Runner(unittest.TestCase):
             real_trading_authorized=True,
         )
         self.runner._accept_entries = True
+        self.runner._emergency_id = f"test-emergency-{self.id()}"
+        self.runner._emergency_id = f"test-emergency-{self.id()}"
         self.params = {"max_trade_amount": 500, "take_profit_pct": 5, "stop_loss_pct": 5}
         self.contract = {
             "symbol": "SPY261105C00761000", "strike": 761,
