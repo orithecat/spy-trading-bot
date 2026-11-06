@@ -16,7 +16,9 @@ Traceback (most recent call last):
     from account_monitor import AccountRiskPollingService
   File "/Users/racheldi/spy-trading-bot-review-sync/account_monitor.py", line 14, in <module>
     from account_risk_monitor import evaluate_account_risk
-ModuleNotFoundError: No module named 'account_risk_monitor'
+  File "/Users/racheldi/spy-trading-bot-review-sync/account_risk_monitor.py", line 18, in <module>
+    from config import BASE_DIR
+ModuleNotFoundError: No module named 'config'
 
 
 ----------------------------------------------------------------------
