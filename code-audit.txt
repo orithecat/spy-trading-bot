@@ -1,0 +1,19 @@
+===== COMMIT =====
+1aee77f Add missing account risk monitor module and refresh tests
+===== REQUIRED FILES =====
+OK account_monitor.py
+OK account_risk_monitor.py
+OK order_execution.py
+OK strategy1_runner.py
+OK tests/test_strategy1_runner.py
+===== EXIT AND EMERGENCY METHODS =====
+strategy1_runner.py:117:    def emergency_stop_complete(self):
+strategy1_runner.py:136:    def emergency_stop(self, emergency_id=None):
+strategy1_runner.py:1164:    def _submit_live_exit(self, direction, bid, reason):
+order_execution.py:211:    def begin_emergency_scan(self, emergency_id):
+order_execution.py:226:    def finish_emergency_scan(self, emergency_id, *, status, phase="RECONCILED"):
+order_execution.py:238:    def journal_external_order(self, open_order, *, emergency_id):
+order_execution.py:393:    def refresh_emergency_orders(self, emergency_id):
+===== TEST RESULTS =====
+ERROR: test_strategy1_runner (unittest.loader._FailedTest.test_strategy1_runner)
+FAILED (errors=1)
