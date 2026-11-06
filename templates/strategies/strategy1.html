@@ -1,0 +1,142 @@
+<button class="back" data-home>← Back to Home</button>
+
+<header>
+  <div>
+    <h1>Strategy 1</h1>
+    <div class="muted">EMA + Confirmed Trailing Buy</div>
+  </div>
+  <span id="detailStatus" class="pill">STOPPED</span>
+</header>
+
+<section class="card">
+  <div class="notice">
+    START enables real Webull option orders when the strategy signal, account snapshot, budget, and risk checks pass.
+  </div>
+</section>
+
+<section class="card">
+  <h3>Strategy Controls</h3>
+  <div class="controls">
+    <button id="startButton" class="start">START</button>
+    <button id="stopButton" class="stop">STOP</button>
+  </div>
+  <button id="emergencyButton" class="emergency">EMERGENCY STOP</button>
+  <p id="detailMessage" class="message" aria-live="polite"></p>
+</section>
+
+<h2>Market &amp; Signal</h2>
+<section class="card metrics">
+  <div class="metric"><div class="metric-label">SPY Price</div><div id="spyPrice" class="metric-value">—</div></div>
+  <div class="metric"><div class="metric-label">Signal</div><div id="signal" class="metric-value">Waiting</div></div>
+  <div class="metric"><div class="metric-label">EMA 9</div><div id="ema9" class="metric-value">—</div></div>
+  <div class="metric"><div class="metric-label">EMA 21</div><div id="ema21" class="metric-value">—</div></div>
+  <div class="metric"><div class="metric-label">EMA 50</div><div id="ema50" class="metric-value">—</div></div>
+  <div class="metric"><div class="metric-label">EMA Gap</div><div id="emaGap" class="metric-value">—</div></div>
+  <div class="metric wide"><div class="metric-label">5-Minute Trend Confirmation</div><div id="fiveMinTrend" class="metric-value">Not connected</div></div>
+  <div class="metric wide"><div class="metric-label">Candidate Option (Legacy)</div><div id="candidateOption" class="metric-value">—</div></div>
+</section>
+
+<h2>Entry Candidates</h2>
+<div class="card">
+  <h3>CALL Candidate</h3>
+  <div class="line"><span>Option Symbol</span><strong id="callCandidateSymbol">—</strong></div>
+  <div class="line"><span>Strike</span><strong id="callCandidateStrike">—</strong></div>
+  <div class="line"><span>Expiry</span><strong id="callCandidateExpiry">—</strong></div>
+  <div class="line"><span>Tracking Low</span><strong id="callCandidateLow">—</strong></div>
+  <div class="line"><span>Trigger Price</span><strong id="callCandidateTrigger">—</strong></div>
+  <div class="line"><span>Entry Eligibility</span><strong id="callCandidateStatus">Waiting</strong></div>
+</div>
+
+<div class="card">
+  <h3>PUT Candidate</h3>
+  <div class="line"><span>Option Symbol</span><strong id="putCandidateSymbol">—</strong></div>
+  <div class="line"><span>Strike</span><strong id="putCandidateStrike">—</strong></div>
+  <div class="line"><span>Expiry</span><strong id="putCandidateExpiry">—</strong></div>
+  <div class="line"><span>Tracking Low</span><strong id="putCandidateLow">—</strong></div>
+  <div class="line"><span>Trigger Price</span><strong id="putCandidateTrigger">—</strong></div>
+  <div class="line"><span>Entry Eligibility</span><strong id="putCandidateStatus">Waiting</strong></div>
+</div>
+
+<h2>Strategy Settings</h2>
+<form id="settingsForm" class="card">
+  <label>
+    Expiry
+    <select name="expiry">
+      <option value="0DTE">0DTE (Default)</option>
+      <option value="1DTE">1DTE</option>
+    </select>
+  </label>
+
+  <label>
+    Max Trade Amount (USD)
+    <input name="max_trade_amount" type="number" min="1" max="1000000" step="1" required>
+  </label>
+
+  <div class="grid">
+    <label>
+      Take Profit (%)
+      <input name="take_profit_pct" type="number" min="0.1" max="500" step="0.1" required>
+    </label>
+    <label>
+      Trailing Stop Loss (%)
+      <input name="stop_loss_pct" type="number" min="0.1" max="100" step="0.1" required>
+    </label>
+  </div>
+
+  <label>
+    Option Rebound Trigger from Tracked Low (%)
+    <input name="rebound_trigger_pct" type="number" min="0.1" max="100" step="0.1" required>
+  </label>
+
+  <h3>Entry Conditions</h3>
+  <p class="muted">These four conditions are always required and cannot be disabled:</p>
+  <ul>
+    <li>1-minute EMA alignment</li>
+    <li>5-minute EMA21/EMA50 trend confirmation</li>
+    <li>Option rebound trigger</li>
+    <li>Quote quality: age ≤10 seconds and spread ≤3%</li>
+  </ul>
+
+  <div class="filter-list">
+    <label class="filter-row">
+      <input type="checkbox" name="filter_ema_gap_not_shrinking">
+      <span>
+        <strong>EMA gap not shrinking (Optional)</strong>
+        <small>Absolute EMA21/EMA50 separation must not be smaller than it was 5 minutes ago.</small>
+      </span>
+    </label>
+  </div>
+
+  <button class="primary">Save Strategy 1 Settings</button>
+  <p id="settingsMessage" class="muted" aria-live="polite"></p>
+</form>
+
+<h2>Order &amp; Positions</h2>
+
+<section class="card">
+  <h3>CALL Position</h3>
+  <div id="callPositionStatus" class="muted">No open position</div>
+  <div class="line"><span>Option Symbol</span><strong id="callSymbol">—</strong></div>
+  <div class="line"><span>Strike</span><strong id="callStrike">—</strong></div>
+  <div class="line"><span>Expiry</span><strong id="callExpiry">—</strong></div>
+  <div class="line"><span>Entry Price</span><strong id="callEntryPrice">—</strong></div>
+  <div class="line"><span>Current Bid</span><strong id="callCurrentBid">—</strong></div>
+  <div class="line"><span>Highest Bid</span><strong id="callHighestBid">—</strong></div>
+  <div class="line"><span>Quantity</span><strong id="callQuantity">—</strong></div>
+  <div class="line"><span>Unrealized P&amp;L (USD)</span><strong id="callPnl">—</strong></div>
+  <div class="line"><span>Status</span><strong id="callStatus">—</strong></div>
+</section>
+
+<section class="card">
+  <h3>PUT Position</h3>
+  <div id="putPositionStatus" class="muted">No open position</div>
+  <div class="line"><span>Option Symbol</span><strong id="putSymbol">—</strong></div>
+  <div class="line"><span>Strike</span><strong id="putStrike">—</strong></div>
+  <div class="line"><span>Expiry</span><strong id="putExpiry">—</strong></div>
+  <div class="line"><span>Entry Price</span><strong id="putEntryPrice">—</strong></div>
+  <div class="line"><span>Current Bid</span><strong id="putCurrentBid">—</strong></div>
+  <div class="line"><span>Highest Bid</span><strong id="putHighestBid">—</strong></div>
+  <div class="line"><span>Quantity</span><strong id="putQuantity">—</strong></div>
+  <div class="line"><span>Unrealized P&amp;L (USD)</span><strong id="putPnl">—</strong></div>
+  <div class="line"><span>Status</span><strong id="putStatus">—</strong></div>
+</section>

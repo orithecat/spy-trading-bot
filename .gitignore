@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+conf/
+# Local account state and settings
+data/
+
+# Local-only files
+.DS_Store
+*.bak
+migration-backup/
+webull_trade_sdk.log*

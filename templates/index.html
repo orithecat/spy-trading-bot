@@ -1,0 +1,13 @@
+<header><div><h1>SPY Trading Bot</h1><div class="muted">Local dashboard</div></div><span class="pill">STRATEGY 1 ONLY</span></header>
+<section class="card"><div class="muted">Today's Total P&amp;L</div><div id="todayPnl" class="pnl">Not connected</div><div class="notice">Webull account equity and live P&amp;L are not connected in this build. This dashboard cannot yet monitor your real account.</div></section>
+<h2>Global Daily Risk Rules</h2>
+<form id="globalSettingsForm" class="card">
+  <label>Daily Profit Cap (%)<input name="daily_profit_cap_pct" type="number" min="0.1" max="1000" step="0.1" required></label>
+  <label>Peak-to-Valley Drawdown Limit (%)<input name="peak_drawdown_limit_pct" type="number" min="0.1" max="100" step="0.1" required></label>
+  <p class="muted">Profit cap is measured from the day's starting account equity. Drawdown is measured from the highest total account equity reached that day, including unrealized P&amp;L.</p>
+  <button class="primary">Save Global Risk Rules</button><p id="globalSettingsMessage" class="muted" aria-live="polite"></p>
+</form>
+<section class="card"><h3>Global risk status</h3><p id="riskStatus" class="message">Loading…</p><p class="muted">The risk helper and lock-state persistence are included, but automatic monitoring and liquidation are not active until a verified Webull account-equity feed and order engine are integrated and tested.</p></section>
+<h2>Strategies</h2><p class="muted">Only Strategy 1 is enabled in this development build. START, STOP and EMERGENCY STOP are inside its own page.</p>
+<div id="strategyList"></div>
+<section class="card"><h3>Strategy status</h3><div id="homeStatuses"></div></section>
