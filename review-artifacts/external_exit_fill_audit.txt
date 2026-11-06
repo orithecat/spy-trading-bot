@@ -1,0 +1,111 @@
+EXTERNAL EXIT FILL JOURNAL AUDIT
+
+===== order_execution.py:440-481 [OrderCoordinator.get_or_create_emergency_baseline] =====
+    def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
+        """Persist account quantity and order fills at the first emergency read."""
+        key = self._emergency_key(contract_key, emergency_id)
+        with self._lock:
+            if key in self._emergency_baselines:
+                baseline = self._emergency_baselines[key]
+                if (not isinstance(baseline, dict)
+                        or int(baseline.get("quantity", -1)) < 0
+                        or int(baseline.get("entry_filled", -1)) < 0
+                        or int(baseline.get("exit_filled", -1)) < 0):
+                    raise OrderStateError("Persisted emergency baseline is malformed.")
+                return dict(baseline)
+            identity = (
+                str(contract_key[0]).upper(), _money(contract_key[1]).normalize(),
+                str(contract_key[2]), str(contract_key[3]).upper(),
+            )
+            totals = {"ENTRY": 0, "EXIT": 0}
+            for order in self._orders.values():
+                contract = order.get("contract", {})
+                try:
+                    order_identity = (
+                        str(contract.get("underlying_symbol", "SPY")).upper(),
+                        _money(contract.get("strike")).normalize(),
+                        str(contract.get("expiry", "")),
+                        str(contract.get("option_type", "")).upper(),
+                    )
+                except ValueError:
+                    continue
+                if order_identity == identity and order.get("role") in totals:
+                    totals[order["role"]] += int(order.get("filled_quantity", 0))
+            baseline = {
+                "quantity": int(quantity),
+                "entry_filled": totals["ENTRY"],
+                "exit_filled": totals["EXIT"],
+                "ledger_open_quantity": totals["ENTRY"] - totals["EXIT"],
+                "external_exit_fills": {},
+            }
+            if baseline["quantity"] < 0:
+                raise OrderStateError("Emergency position quantity is invalid.")
+            self._emergency_baselines[key] = baseline
+            self._save()
+            return dict(baseline)
+
+===== order_execution.py:503-526 [OrderCoordinator.record_emergency_external_fill] =====
+    def record_emergency_external_fill(self, contract_key, client_order_id,
+                                       filled_quantity, *, emergency_id):
+        """Persist a matched external SELL_TO_CLOSE fill once by order ID."""
+        key = self._emergency_key(contract_key, emergency_id)
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise OrderStateError("External closing order identity is invalid.")
+        try:
+            filled_quantity = int(filled_quantity)
+        except (TypeError, ValueError):
+            raise OrderStateError("External closing order fill is invalid.") from None
+        if filled_quantity < 0:
+            raise OrderStateError("External closing order fill is invalid.")
+        with self._lock:
+            baseline = self._emergency_baselines.get(key)
+            if not isinstance(baseline, dict):
+                raise OrderStateError("Emergency baseline is unavailable.")
+            fills = baseline.setdefault("external_exit_fills", {})
+            if not isinstance(fills, dict):
+                raise OrderStateError("Emergency external fill state is malformed.")
+            previous = fills.get(client_order_id, 0)
+            if not isinstance(previous, int) or previous < 0:
+                raise OrderStateError("Emergency external fill state is malformed.")
+            fills[client_order_id] = max(previous, filled_quantity)
+            self._save()
+
+===== order_execution.py:937-971 [OrderCoordinator.confirm_emergency_order] =====
+    def confirm_emergency_order(self, open_order, *, emergency_id):
+        """Journal an external order before its order-detail request."""
+        record = self.journal_external_order(open_order, emergency_id=emergency_id)
+        if record.get("role") == "EXTERNAL_UNKNOWN":
+            raise OrderStateError("External order cannot be safely identified.")
+        self._set_external_order_phase(
+            record["client_order_id"], emergency_id, "DETAIL_QUERY_REQUESTED"
+        )
+        with self._lock:
+            try:
+                payload = _payload(self.order_api.get_order_detail(
+                    self.account_id, record["client_order_id"]
+                ))
+                item = _order_item(payload)
+                if item.get("client_order_id") not in (None, record["client_order_id"]):
+                    raise OrderStateError("Order detail belongs to a different order.")
+                current = self._orders[record["client_order_id"]]
+                self._apply_detail(current, item)
+                current["emergency_phase"] = (
+                    "UNRESOLVED" if current.get("reconciliation_conflict")
+                    or current.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                )
+                self._save()
+                if current.get("status") == "UNKNOWN":
+                    raise OrderStateError("External order detail is unresolved.")
+                return dict(current)
+            except OrderStateError:
+                raise
+            except Exception:
+                current = self._orders[record["client_order_id"]]
+                current["status"] = "UNKNOWN"
+                current["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                self._update_quantity_tracking(current)
+                self._save()
+                raise OrderStateError("External order detail is unresolved.") from None
+
+===== ALL RUNNER CALL SITES =====
+699: detail = coordinator.confirm_emergency_order(
