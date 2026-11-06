@@ -1,133 +1,43 @@
-# Webull SPY Trading Bot — Project Work Rules
+# Webull SPY 自动交易项目工作规则
 
-## 1. 工作目标
+## 一、项目与分支
+- 本地项目：`~/spy-trading-bot`
+- GitHub 仓库：`orithecat/spy-trading-bot`
+- 唯一分支：`main`。所有开发、测试、提交和上传都直接在 `main` 完成。
+- 禁止创建或使用其他分支、review 仓库或 clone。
+- 不需要用户反复确认分支或仓库。
 
-持续推进 Webull SPY Trading Bot 的实际开发和修复。
+## 二、代码修改
+- 直接修改项目原文件，不创建代码副本。
+- 禁止创建 `.bak`、时间戳备份、review 文件或其他不必要的文件。
+- 必要时可以新增或修改 `test_*.py` 测试文件。
+- 未经用户明确同意，不得修改策略参数、入场条件、退出条件、资金分配或风险限制。
+- 优先自行检查项目和 GitHub 源码，不要反复要求用户粘贴代码。
 
-优先利用历史对话、GitHub 当前分支、源码、提交记录和测试结果恢复进度。不要让我重复提供已有信息。
+## 三、测试与上传
+- 修改后检查实际代码和 `git diff`。
+- 运行必要的语法检查和测试，失败必须先修复。
+- 给用户的代码修改命令，默认必须包含修改、必要测试、Git commit 和 `git push origin main`，尽量一条命令完成。
+- 不要把简单修改拆成多条命令，让用户反复操作。
+- 修改或测试失败时，立即停止，不得继续提交或上传。
+- 上传后由 ChatGPT 自行检查 GitHub `main` 上的实际文件。
+- 未经验证，不得声称修改、测试或上传成功。
 
-每轮工作必须产生可验证的实际进展。禁止反复诊断、猜测根因、重复测试或无意义地修改测试文件。
+## 四、交易安全
+- 只能使用唯一匹配的 `MARGIN` 账户，绝不使用 `CASH`。
+- 禁止用真实 BUY 订单进行测试；未经用户明确授权，不得开启真实 BUY。
+- 所有自动平仓必须使用 MARKET `SELL_TO_CLOSE`，禁止使用 LIMIT 订单兜底。
+- 必须核实实际成交，正确处理部分成交、拒单、超时和未知订单状态。
+- 普通 STOP 只阻止新入场，不平掉已有仓位。
+- Emergency Stop 是账户级操作，只有确认全部清仓后才能解除。
+- START 不得自动下 BUY 订单，不增加独立的 Emergency Stop Reset 按钮。
+- Strategy 1 和 Strategy 2 可以同时运行，各自管理资金和交易，同时遵守账户级全局风控。
+- 账户核对重点是期权合约身份和数量。无害的金额舍入或更新时间差异不能单独视为持仓冲突。
+- 不得绕过订单状态、持仓数量或成交确认检查。
 
-## 2. 根因分析与修复
-
-修改前必须确认：
-
-- 具体文件、类和函数；
-- 实际代码执行路径；
-- 当前逻辑为什么出错；
-- 预期行为是什么；
-- 为什么修改能解决问题；
-- 对其他模块和安全机制的影响。
-
-区分生产代码缺陷、测试夹具缺陷、接口不匹配和环境问题。
-
-测试失败不代表生产代码一定有问题；测试通过也不代表生产代码一定正确。
-
-测试数据错误时只修正必要的测试数据。生产代码有缺陷时必须修复生产代码。绝不为了通过测试而降低安全检查。
-
-根因必须有源码或执行结果作为证据。改变之前确认的判断时，必须说明新证据及改变原因。
-
-## 3. 修改与验证
-
-- 以当前实际源码为准，不能依赖旧版本或过期代码锚点。
-- 修改前备份文件。
-- 确认补丁目标唯一且存在。
-- 补丁失败或写入验证失败时立即停止，不运行测试、commit 或 push。
-- 修改成功后验证实际写入。
-- 按顺序执行 `py_compile`、针对性测试、完整相关测试。
-- 测试失败后根据新 traceback 修改代码，不重复运行未修改的失败代码。
-- 检查 `git diff`、`git diff --check` 和安全规则回归。
-- 全部验证通过后再提交和推送。
-
-不得虚报读取、修改、测试、提交或推送结果。
-
-## 4. Terminal 命令规范
-
-我在 Mac Terminal 使用 zsh。
-
-- 默认提供短小、独立、可直接复制的 COMMAND。
-- 避免复杂 heredoc、未闭合引号、多层嵌套引号和可能导致 `>....` 等待输入的命令。
-- 复杂修改优先使用独立 Python 脚本。
-- 多步骤操作拆开，每一步说明预期结果。
-- 每条命令必须有明确失败退出机制。
-- 补丁失败后绝不继续测试、提交或推送。
-- 不把修改、测试、commit 和 push 塞进一个超长命令。
-- 不让我粘贴大段源码；优先从 GitHub 读取。
-
-## 5. GitHub 协作
-
-仓库：`orithecat/spy-trading-bot`
-
-唯一基准分支：`main`（`origin/main`）
-
-本地项目：`~/spy-trading-bot`
-
-其他 review 仓库或分支仅作历史参考；除非用户明确指定，不得作为当前代码基准。
-
-虚拟环境：`~/spy-trading-bot/.venv`
-
-GitHub 是持续审查和同步的重要依据，但必须确认分支和提交确实是最新版本，不能把旧源码当成本地最新代码。
-
-不要提交备份文件、`__pycache__`、临时日志或无关文件。提交前检查 diff；push 后确认远端分支更新。
-
-## 6. 交易安全要求（不可擅自改变）
-
-- 只允许精确的 `MARGIN` 账户，绝不使用 `CASH`。
-- 禁止真实 BUY 测试，真实 BUY 保持禁用，未经授权不得开启。
-- 所有自动退出必须使用 MARKET `SELL_TO_CLOSE`，不允许 LIMIT 兜底。
-- 必须跟踪真实成交，正确处理部分成交、拒单、超时和未知状态；提交订单不代表成交。
-- 普通 STOP 只停止对应策略的新入场，不平掉已有仓位。
-- Emergency Stop 是账户级操作。
-- START 不得自动 BUY；按既定恢复逻辑解除 Emergency Stop，不增加独立 Reset 按钮。
-- 只有完整、最新的账户快照确认无持仓、无活动或未知订单、无未解决敞口且剩余数量全部为零，才能报告 Emergency Stop 已清仓。
-- Strategy 1 和 Strategy 2 可以同时运行，必须独立管理交易和资金，并执行账户级全局风险控制。
-- 账户核对应优先检查期权合约身份和持仓数量。无害的金额舍入或更新时间差异不能被误判为持仓风险冲突。
-- 不得为了通过测试而绕过合约身份、数量、订单状态或成交确认检查。
-- 不得擅自改变策略参数、入场条件、退出条件、资金限制和风险控制。
-
-## 7. 每轮交付标准
-
-每次回复简洁说明：
-
-1. 当前修复目标；
-2. 已确认的根因和证据；
-3. 修改文件及具体函数；
-4. 下一条安全、可执行的 COMMAND；
-5. 预期结果和实际验证结果。
-
-维护连续的修复记录，包括已确认事实、已修改文件、测试结果、未解决问题和下一步工作。
-
-不要让我承担反复试错的成本。不要每次重新开始同一个问题。保持技术判断、证据和修复进度的连续性。
-## Assistant Communication Style
-
-- 除可执行的 command 外，每次回复只说 1–2 句话解释。
-- 保持简洁，优先一次提供一条可直接复制运行的 command。
-- 避免长篇解释、重复背景和不必要的检查。
-- 只有确实需要用户决定或授权时才提问。
-
-## GitHub Workflow Requirements
-
-- 每次修改代码完成后，都必须立即提交并推送到 GitHub，不要累积多次修改后才上传。
-- 如果需要读取或检查代码，优先直接从 GitHub 仓库读取，不要要求用户复制粘贴代码。
-- 不要求用户每次推送前先提供 DIFF；用户直接推送后，助手必须读取 GitHub 上的实际文件和代码，检查修改是否正确，并明确报告验证结果。
-
-## READ 指令与行为纠正规则
-
-- 用户发送 `READ` 加项目规则文件链接时，必须直接打开链接并读取文件内容，不得要求用户复制或粘贴文件内容。
-- 如果用户重复发送 READ，或指出助手没有遵守规则，必须回顾之前的实际回复，定位违反的具体规则和错误行为。
-- 必须明确承认具体错误，并据此调整后续行为；不得只重复规则摘要后继续犯同样的错误。
-- 用户要求从 GitHub 读取源码时，必须由助手自行读取 GitHub 上对应分支的实际文件和测试代码。
-- 严禁使用要求用户运行 `grep`、`cat`、`sed` 等命令并粘贴源码输出的方式代替助手读取 GitHub。
-- 只有需要用户本地执行修改、测试、提交或推送等操作时，才提供相应 COMMAND。命令应让用户返回执行状态、错误信息或测试结果，不得要求用户提供源码。
-- 如果无法直接访问 GitHub 或无法执行某项操作，必须明确说明限制和未完成事项，不得假装已经读取、修改或验证。
-- 用户再次发送 READ 或纠正指令时，优先解决指令理解和行为偏差，不要擅自转回代码诊断或要求用户执行其他操作。
-
-
-## GitHub Source of Truth and Mandatory Publishing
-
-- GitHub `origin/main` is the single source of truth for project code and project rules.
-- Before proposing or making any code change, read the latest relevant files directly from GitHub `origin/main`. Never assume local code matches GitHub without verification.
-- After every code modification, publish the changed files to GitHub `origin/main`. Do not leave completed code changes only on the local machine.
-- Run the relevant validation and tests before publishing. Report any failures honestly; never claim a change is verified when tests have not passed.
-- After every push, read the changed files directly from GitHub again and verify that the uploaded content matches the intended changes.
-- Commit and push only the intended project files. Never accidentally include user data, logs, backups, credentials, or unrelated untracked files.
+## 五、工作方式
+- 以完成实际交易功能为目标，不做无关的仓库和流程管理。
+- 直接解决问题，避免重复诊断和冗长解释。
+- 命令简短、可复制，尽量一次完成修改、测试和上传。
+- 简洁报告修改内容、测试结果和未解决问题。
+- 无法执行或验证时，必须如实说明。
