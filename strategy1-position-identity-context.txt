@@ -1,0 +1,157 @@
+435-        self.runner._accept_entries = True
+436-        self.runner._emergency_id = f"test-emergency-{self.id()}"
+437-        self.runner._emergency_id = f"test-emergency-{self.id()}"
+438-        self.params = {"max_trade_amount": 500, "take_profit_pct": 5, "stop_loss_pct": 5}
+439-        self.contract = {
+440-            "symbol": "SPY261105C00761000", "strike": 761,
+441-            "expiry": "2026-11-05", "option_type": "CALL",
+442-        }
+443-
+444-    @staticmethod
+445:    def account_option_position(quantity=1, direction="CALL"):
+446-        leg = SimpleNamespace(
+447-            symbol="SPY", quantity=Decimal(quantity), option_type=direction,
+448-            expiration_date="2026-11-05", exercise_price=Decimal("761"),
+449-        )
+450-        return SimpleNamespace(
+451-            symbol="SPY", instrument_type="OPTION", currency="USD",
+452-            quantity=Decimal(quantity), option_strategy="SINGLE", legs=(leg,),
+453-        )
+454-
+455-    def add_reconciliation_entry(self, *, direction="CALL", filled=1):
+456-        contract = {
+457-            "symbol": "SPY261105C00761000" if direction == "CALL" else "SPY261105P00761000",
+458-            "underlying_symbol": "SPY", "strike": "761",
+459-            "expiry": "2026-11-05", "option_type": direction,
+460-        }
+461-        self.coordinator._orders.append({
+462-            "client_order_id": "reconcile-entry", "position_key": "reconcile-entry",
+463-            "role": "ENTRY", "direction": direction, "contract": contract,
+464-            "quantity": filled, "filled_quantity": filled,
+465-            "filled_price": "1.002", "status": "FILLED",
+466-        })
+467-
+468-    def test_amount_differences_do_not_fail_matching_position_reconciliation(self):
+469-        self.runner._order_coordinator = self.coordinator
+470-        self.add_reconciliation_entry()
+471-        position = self.account_option_position(1)
+472-        position.cost_price = Decimal("1.002")
+473-        position.last_price = Decimal("1.01")
+474-        position.unrealized_profit_loss = Decimal("0.80")
+475-        self.account_monitor.account_data.positions = (position,)
+476-        self.account_monitor.account_data.equity = Decimal("100.10")
+477-        self.account_monitor.account_data.option_buying_power = Decimal("25.00")
+478-        # The fill ledger implies $100.20 notional; monetary differences are
+479-        # deliberately outside the position identity/quantity reconciliation.
+480-
+1036-            self._emergency_account_flat = all_flat
+1037-        if all_flat:
+1038-            self._set_message("Emergency Stop confirmed flat from reconciled positions and order fills.")
+1039-        elif account_positions or open_orders or active_orders or current_known_exposure:
+1040-            self._set_message("Emergency Stop is active; confirmed positions and orders are being reconciled.")
+1041-        else:
+1042-            self._set_emergency_block("Position and order quantities are not sufficiently reconciled.")
+1043-
+1044-    @staticmethod
+1045-    def _contract_key(contract):
+1046-        try:
+1047-            option_type = str(contract.get("option_type", "")).upper()
+1048-            strike = Decimal(str(contract.get("strike", contract.get("strike_price"))))
+1049-            expiry = str(contract.get("expiry", contract.get("expiration_date", contract.get("option_expire_date", ""))))
+1050-            if option_type not in ("CALL", "PUT") or not strike.is_finite() or not expiry:
+1051-                return None
+1052-            return option_type, strike.normalize(), expiry
+1053-        except Exception:
+1054-            return None
+1055-
+1056:    def _sync_live_positions(self, coordinator):
+1057-        orders = coordinator.orders()
+1058-        entries = [order for order in orders if order.get("role") == "ENTRY"]
+1059-        rebuilt = {"CALL": None, "PUT": None}
+1060-        for entry in entries:
+1061-            entry_filled = int(entry.get("filled_quantity", 0))
+1062-            if entry_filled <= 0 or not entry.get("filled_price"):
+1063-                continue
+1064-            exits = [order for order in orders if order.get("role") == "EXIT"
+1065-                     and order.get("position_key") == entry.get("client_order_id")]
+1066-            sold = sum(int(order.get("filled_quantity", 0)) for order in exits)
+1067-            remaining = max(0, entry_filled - sold)
+1068-            if remaining <= 0:
+1069-                continue
+1070-            direction = entry.get("direction")
+1071-            if direction not in rebuilt:
+1072-                continue
+1073-            contract = entry.get("contract", {})
+1074-            active_exit = next((order for order in reversed(exits)
+1075-                                if order.get("status") in ("SUBMITTING", "PENDING", "SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNKNOWN")), None)
+1076-            position = {
+1077-                "direction": direction,
+1078-                "symbol": contract.get("symbol"),
+1079-                "strike": contract.get("strike"),
+1080-                "expiry": contract.get("expiry"),
+1081-                "option_type": contract.get("option_type"),
+1082-                "entry_price": float(Decimal(entry["filled_price"])),
+1083-                "quantity": remaining,
+1084-                "opened_at": entry.get("created_at"),
+1085-                "highest_bid": float(Decimal(entry["filled_price"])),
+1086-                "current_bid": float(Decimal(entry["filled_price"])),
+1087-                "take_profit_pct": float(entry.get("take_profit_pct") or 4),
+1088-                "stop_loss_pct": float(entry.get("stop_loss_pct") or 5),
+1089-                "unrealized_pnl": 0.0,
+1090-                "status": (
+1091-                    f"EXIT {active_exit.get('status')} — LIVE"
+1092-                    if active_exit is not None else "OPEN — LIVE"
+1093-                ),
+1094-                "entry_client_order_id": entry.get("client_order_id"),
+1095-                "exit_client_order_id": active_exit.get("client_order_id") if active_exit else None,
+1096-                "exit_rejected": any(order.get("status") == "REJECTED" for order in exits),
+1097-            }
+1098-            if position["exit_rejected"]:
+1099-                position["status"] = "EXIT REJECTED — RETRYING"
+1100-            previous = rebuilt[direction]
+1101-            if previous is not None:
+1102-                # Multiple live positions in one direction cannot be represented
+1103-                # safely by this strategy's one-slot-per-direction model.
+1104-                self._account_positions_reconciled = False
+1105-                continue
+1106-            rebuilt[direction] = position
+1107-        with self._lock:
+1108-            self.positions = rebuilt
+1109-        self._publish_positions()
+1110-
+1111-    def _submit_live_entry(self, direction, contract, quote, params, decision,
+1112-                           account_snapshot, coordinator):
+1113-        if not self.real_trading_authorized:
+1114-            self._set_message("Real entry authorization is disabled; no BUY order was submitted.")
+1115-            return
+1116-        if not self.account_monitor.allows_new_entries() or not self._account_positions_reconciled:
+1117-            return
+1118-        ask = self._number(quote.get("ask"))
+1119-        if ask is None or ask <= 0:
+1120-            return
+1121-        account_data = account_snapshot.get("account_data")
+1122-        if account_data is None or account_data.account_type != "MARGIN":
+1123-            return
+1124-        with state_lock:
+1125-            if state.get("risk_latched") is not False:
+1126-                return
+1127-        with self._lock:
+1128-            if self.positions[direction] is not None or not self._accept_entries or self._emergency:
+1129-                return
+1130-            allocated_budget = sum(
+1131-                position["entry_price"] * 100 * position["quantity"]
+1132-                for position in self.positions.values()
+1133-                if position is not None
+1134-            )
+1135-            try:
+1136-                record = coordinator.submit_entry(
+1137-                    signal_key=f"{direction}:{contract.get('symbol')}:{decision.get('trigger_price')}:{contract.get('expiry', contract.get('expiration_date'))}",
+1138-                    contract=contract,
+1139-                    direction=direction,
+1140-                    price=ask,
+1141-                    max_trade_amount=params.get("max_trade_amount"),
+1142-                    allocated_amount=allocated_budget,
+1143-                    option_buying_power=account_data.option_buying_power,
+1144-                    take_profit_pct=params["take_profit_pct"],
+1145-                    stop_loss_pct=params["stop_loss_pct"],
+1146-                )
