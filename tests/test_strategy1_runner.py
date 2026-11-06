@@ -256,7 +256,6 @@ class TestStrategy1Runner(unittest.TestCase):
             order_coordinator_factory=lambda *_args, **_kwargs: self.coordinator,
             real_trading_authorized=True,
         )
-        self.runner._emergency_id = "offline-test-emergency"
         self.runner._accept_entries = True
         self.params = {"max_trade_amount": 500, "take_profit_pct": 5, "stop_loss_pct": 5}
         self.contract = {
