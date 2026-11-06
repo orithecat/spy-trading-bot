@@ -269,6 +269,13 @@ class DashboardRunnerIntegrationTests(unittest.TestCase):
         for method in self.engine.order_methods.values():
             method.assert_not_called()
 
+    def test_dashboard_does_not_report_started_when_runner_start_returns_false(self):
+        with patch.object(runner, "start", return_value=False):
+            status, result = self.post_control("start")
+        self.assertNotEqual(status, 200, result)
+        self.assertFalse(state["strategies"]["strategy1"]["running"])
+        self.assertIsNone(state["active_strategy"])
+
     def test_start_submits_real_order_and_builds_position_from_mock_fill(self):
         status, result = self.post_control("start")
         self.assertEqual(status, 200, result)

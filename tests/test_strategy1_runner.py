@@ -534,6 +534,18 @@ class TestStrategy1Runner(unittest.TestCase):
             self.runner._reconcile_account_positions(self.account_monitor.account_data)
         )
 
+    def test_start_does_not_mutate_state_when_previous_worker_is_exiting(self):
+        thread = Mock()
+        thread.is_alive.return_value = True
+        self.runner._thread = thread
+        self.runner._worker_active = False
+        self.runner._accept_entries = False
+        with patch.object(self.runner, "_worker") as worker:
+            self.assertFalse(self.runner.start())
+        self.assertFalse(self.runner._worker_active)
+        self.assertFalse(self.runner._accept_entries)
+        worker.assert_not_called()
+
     def test_default_runner_start_does_not_authorize_real_buys(self):
         runner = Strategy1Runner(
             engine_factory=Mock, account_monitor=self.account_monitor,
