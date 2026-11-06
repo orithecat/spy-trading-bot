@@ -1,0 +1,1597 @@
+STRATEGY 1 OFFLINE PATCH REVIEW
+READ ONLY — NO SOURCE FILES MODIFIED
+
+
+===== tests/test_strategy1_runner.py:14-198 [FakeCoordinator] =====
+class FakeCoordinator:
+    def __init__(self, *_args, **_kwargs):
+        self._orders = []
+        self.submit_calls = []
+        self.cancel_calls = []
+        self.exit_calls = []
+        self.broker_open_orders = []
+        self.confirmed_orders = {}
+        self.emergency_baselines = {}
+        self.cancel_external_calls = []
+        self.external_entry_states = []
+        self.reconciliation_states = {}
+        self.external_cancel_results = {}
+
+    def orders(self):
+        return [dict(order) for order in self._orders]
+
+    def active_orders(self, role=None):
+        terminal = {"FILLED", "CANCELLED", "REJECTED"}
+        return [dict(order) for order in self._orders
+                if order["status"] not in terminal and (role is None or order["role"] == role)]
+
+    def refresh_active(self):
+        return []
+
+    def has_unknown_order(self):
+        return any(order["status"] == "UNKNOWN" for order in self._orders)
+
+    def submit_entry(self, *, signal_key, contract, direction, price,
+                     max_trade_amount, allocated_amount, option_buying_power,
+                     take_profit_pct, stop_loss_pct):
+        quantity = min(
+            int((float(max_trade_amount) - float(allocated_amount)) // (float(price) * 100)),
+            int(float(option_buying_power) // (float(price) * 100)),
+        )
+        if quantity < 1:
+            raise ValueError("budget insufficient")
+        self.submit_calls.append((signal_key, contract, direction, price))
+        order = {
+            "client_order_id": f"entry-{len(self.submit_calls)}",
+            "order_id": f"order-{len(self.submit_calls)}",
+            "signal_key": signal_key,
+            "position_key": f"entry-{len(self.submit_calls)}",
+            "role": "ENTRY",
+            "direction": direction,
+            "contract": {
+                "symbol": contract["symbol"],
+                "strike": str(contract.get("strike_price", contract.get("strike"))),
+                "expiry": contract.get("expiration_date", contract.get("expiry")),
+                "option_type": direction,
+            },
+            "quantity": quantity,
+            "filled_quantity": quantity,
+            "filled_price": str(float(price) - 0.02),
+            "limit_price": str(price),
+            "status": "FILLED",
+            "take_profit_pct": take_profit_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "created_at": "2026-11-05T18:00:00+00:00",
+        }
+        self._orders.append(order)
+        return dict(order)
+
+    def list_open_orders(self):
+        return [dict(order) for order in self.broker_open_orders]
+
+    def confirm_order(self, client_order_id):
+        return dict(self.confirmed_orders[client_order_id])
+
+    def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        entry_filled = 0
+        exit_filled = 0
+        for order in self._orders:
+            contract = order.get("contract", {})
+            identity = (
+                str(contract.get("underlying_symbol", "SPY")).upper(),
+                Decimal(str(contract.get("strike"))).normalize(),
+                str(contract.get("expiry")),
+                str(contract.get("option_type", "")).upper(),
+            )
+            expected = (
+                str(contract_key[0]).upper(), Decimal(str(contract_key[1])).normalize(),
+                str(contract_key[2]), str(contract_key[3]).upper(),
+            )
+            if identity == expected:
+                if order.get("role") == "ENTRY":
+                    entry_filled += int(order.get("filled_quantity", 0))
+                elif order.get("role") == "EXIT":
+                    exit_filled += int(order.get("filled_quantity", 0))
+        return self.emergency_baselines.setdefault(
+            key, {"quantity": quantity, "entry_filled": entry_filled,
+                  "exit_filled": exit_filled,
+                  "ledger_open_quantity": entry_filled - exit_filled,
+                  "external_exit_fills": {}}
+        )
+
+    def record_emergency_external_entry(self, open_order, detail):
+        record = dict(open_order)
+        record.update(detail)
+        self.external_entry_states.append(record)
+        if record.get("legs"):
+            leg = record["legs"][0]
+            self._orders.append({
+                "client_order_id": record["client_order_id"],
+                "role": "ENTRY", "direction": leg["option_type"],
+                "contract": {
+                    "underlying_symbol": record.get("symbol", leg.get("symbol", "SPY")),
+                    "strike": leg["strike_price"],
+                    "expiry": leg["option_expire_date"],
+                    "option_type": leg["option_type"],
+                },
+                "quantity": int(record.get("total_quantity", record.get("quantity", 1))),
+                "filled_quantity": int(record.get("filled_quantity", 0)),
+                "filled_price": record.get("filled_price"),
+                "status": record["status"],
+                "cancelled_quantity": int(record.get("quantity", 1)) - int(record.get("filled_quantity", 0))
+                    if record["status"] in ("CANCELLED", "CANCELED") else 0,
+                "unresolved_quantity": 0,
+            })
+        return record
+
+    def record_emergency_reconciliation(self, contract_key, values, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        self.reconciliation_states[key] = dict(values)
+
+    def record_emergency_external_fill(self, contract_key, client_order_id,
+                                       filled_quantity, *, emergency_id):
+        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+        baseline = self.emergency_baselines[key]
+        fills = baseline.setdefault("external_exit_fills", {})
+        fills[client_order_id] = max(fills.get(client_order_id, 0), filled_quantity)
+
+    def cancel_external(self, client_order_id):
+        self.cancel_external_calls.append(client_order_id)
+        self.broker_open_orders = [
+            order for order in self.broker_open_orders
+            if order.get("client_order_id") != client_order_id
+        ]
+        return self.external_cancel_results.get(
+            client_order_id,
+            {"client_order_id": client_order_id, "status": "CANCELLED"},
+        )
+
+    def submit_exit(self, *, position_key, contract, direction, quantity, price=None,
+                    underlying_symbol=None, source="strategy1",
+                    emergency_baseline_quantity=None, broker_covered_quantity=0):
+        self.exit_calls.append({
+            "position_key": position_key, "contract": contract,
+            "direction": direction, "quantity": quantity, "price": price,
+            "underlying_symbol": underlying_symbol, "source": source,
+            "request": {
+                "instrument_type": "OPTION", "option_strategy": "SINGLE",
+                "side": "SELL", "position_intent": "SELL_TO_CLOSE",
+                "order_type": "MARKET", "time_in_force": "DAY",
+                "entrust_type": "QTY", "support_trading_session": "CORE",
+                "quantity": str(quantity),
+            },
+        })
+        order = {
+            "client_order_id": f"exit-{len(self._orders)}",
+            "order_id": f"exit-order-{len(self._orders)}",
+            "position_key": position_key,
+            "role": "EXIT",
+            "direction": direction,
+            "quantity": quantity,
+            "filled_quantity": quantity,
+            "filled_price": "1.25",
+            "limit_price": None,
+            "order_type": "MARKET",
+            "request": dict(self.exit_calls[-1]["request"]),
+            "source": source,
+            "emergency_baseline_quantity": emergency_baseline_quantity,
+            "contract": {**contract, "underlying_symbol": underlying_symbol or "SPY"},
+            "status": "FILLED",
+        }
+        self._orders.append(order)
+        return dict(order)
+
+    def cancel(self, client_order_id):
+        self.cancel_calls.append(client_order_id)
+        for order in self._orders:
+            if order["client_order_id"] == client_order_id:
+                order["status"] = "CANCELLED"
+                return dict(order)
+
+===== tests/test_strategy1_runner.py:201-239 [FakeAccountMonitor] =====
+class FakeAccountMonitor:
+    def __init__(self, allowed=True, *, positions=()):
+        self.allowed = allowed
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.snapshot_calls = 0
+        self.account_api_calls = 0
+        self.order_api = object()
+        self.account_data = SimpleNamespace(
+            account_id="OFFLINE-MARGIN",
+            account_type="MARGIN",
+            positions_complete=True,
+            option_buying_power=10000,
+            positions=positions,
+        )
+        self.polled_at_monotonic = 100
+        self.monotonic = lambda: 101
+
+    def start(self):
+        self.start_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def allows_new_entries(self):
+        return self.allowed
+
+    def get_snapshot(self):
+        self.snapshot_calls += 1
+        return {
+            "account_data": self.account_data,
+            "polled_at_monotonic": self.polled_at_monotonic,
+        }
+
+    def get_order_api(self):
+        return self.order_api
+
+    def snapshot_is_fresh(self):
+        return True
+
+===== strategy1_runner.py:243-398 [run_once] =====
+    def run_once(self):
+        """One deterministic scan cycle; useful for mocked offline tests."""
+        with self._lock:
+            emergency_mode = self._emergency
+        if self._engine is None and not emergency_mode:
+            raise RuntimeError("Market data engine is not initialized")
+
+        if self._engine is not None:
+            market = self._engine.get_market_snapshot()
+            self._publish_market(market)
+        else:
+            market = {"entry_data_valid": False}
+
+        account_snapshot = self.account_monitor.get_snapshot()
+        coordinator = self._ensure_order_coordinator(account_snapshot)
+        if coordinator is not None:
+            try:
+                coordinator.refresh_active()
+                self._sync_live_positions(coordinator)
+                if account_snapshot.get("account_data") is not None:
+                    self._account_positions_reconciled = self._reconcile_account_positions(
+                        account_snapshot["account_data"]
+                    )
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self._account_positions_reconciled = False
+        elif self._order_coordinator is not None:
+            # Keep managing known fills during an account monitor outage. New
+            # entries remain blocked by the monitor's local snapshot gate.
+            try:
+                self._order_coordinator.refresh_active()
+                self._sync_live_positions(self._order_coordinator)
+            except Exception:
+                self._account_positions_reconciled = False
+
+        with self._lock:
+            accepting_entries = self._accept_entries
+            emergency_stop = self._emergency
+        if coordinator is not None and (not accepting_entries or emergency_stop):
+            # STOP and EMERGENCY STOP also cancel unfilled entry remainders so
+            # they cannot unexpectedly open new risk after the control action.
+            for pending in coordinator.active_orders(role="ENTRY"):
+                coordinator.cancel(pending["client_order_id"])
+            self._sync_live_positions(coordinator)
+
+        if emergency_mode:
+            account_data = account_snapshot.get("account_data")
+            if coordinator is None or account_data is None:
+                self._set_emergency_block("Verified MARGIN account data or order API is unavailable.")
+            else:
+                self._emergency_close_account_positions(
+                    account_snapshot, account_data, coordinator
+                )
+
+        with self._lock:
+            accepting = self._accept_entries
+            emergency = self._emergency
+            positions = dict(self.positions)
+
+        # Manage existing positions first, regardless of entry time gates.
+        if not emergency:
+            for direction, position in positions.items():
+                if position is not None:
+                    self._manage_position(direction, position)
+
+        with self._lock:
+            accepting = self._accept_entries
+            emergency = self._emergency
+
+        if (not accepting or emergency or not self.real_trading_authorized
+                or not market.get("entry_data_valid")):
+            return
+        if not self.account_monitor.allows_new_entries():
+            return
+        if coordinator is None or not self._account_positions_reconciled:
+            return
+        if coordinator.has_unknown_order():
+            self._set_message("Order status is unknown; new entries are locked until reconciled.")
+            return
+
+        with state_lock:
+            if state.get("risk_latched") is not False:
+                return
+            strategy_settings = dict(settings["strategy1"])
+            strategy_settings["entry_filters"] = dict(
+                settings["strategy1"].get("entry_filters", {})
+            )
+
+        expiry = self._expiry_date(strategy_settings["expiry"]).isoformat()
+
+        for direction in DIRECTIONS:
+            with self._lock:
+                if self.positions[direction] is not None:
+                    continue
+                if not self._accept_entries or self._emergency:
+                    break
+            if not self.account_monitor.allows_new_entries() or not self._account_positions_reconciled:
+                break
+
+            try:
+                option_data = self._engine.get_nearest_otm_option_snapshot(
+                    expiry=expiry,
+                    option_type=direction,
+                    spy_price=market["spy_price"],
+                )
+                contract = option_data["contract"]
+                quote = option_data["quote"]
+                history = self._engine.option_history.get_recent_low(
+                    option_symbol=contract["symbol"],
+                    lookback_minutes=30,
+                    max_bar_age_seconds=120,
+                )
+                if not history.get("history_valid"):
+                    continue
+
+                decision = evaluate_entry(
+                    direction=direction,
+                    expiry=strategy_settings["expiry"],
+                    ema9=market.get("ema9"),
+                    ema21=market.get("ema21"),
+                    ema50=market.get("ema50"),
+                    ema_gap_now=market.get("ema_gap"),
+                    ema_gap_5m_ago=market.get("ema_gap_5m_ago"),
+                    spy_price=market.get("spy_price"),
+                    five_min_trend=market.get("five_min_trend"),
+                    option_low=history.get("recent_low"),
+                    option_ask=quote.get("ask"),
+                    bid=quote.get("bid"),
+                    ask=quote.get("ask"),
+                    quote_age_seconds=quote.get("quote_age_seconds"),
+                    rebound_trigger_pct=strategy_settings["rebound_trigger_pct"],
+                    entry_filters=strategy_settings.get("entry_filters"),
+                )
+                self._publish_candidate(direction, contract, history, decision)
+
+                if decision.get("eligible"):
+                    self._submit_live_entry(
+                        direction,
+                        contract,
+                        quote,
+                        strategy_settings,
+                        decision,
+                        account_snapshot,
+                        coordinator,
+                    )
+                    self._sync_live_positions(coordinator)
+                    if self.positions[direction] is not None:
+                        self._account_positions_reconciled = False
+            except Exception as exc:
+                log_event(
+                    "entry_scan_error",
+                    strategy="strategy1",
+                    direction=direction,
+                    error=str(exc),
+                    mode="live",
+                )
+
+===== strategy1_runner.py:433-515 [_reconcile_account_positions] =====
+    def _reconcile_account_positions(self, account_data):
+        """Compare option contract identity and quantity, never account amounts."""
+        positions = getattr(account_data, "positions", None)
+        if (getattr(account_data, "positions_complete", False) is not True
+                or not isinstance(positions, (tuple, list))):
+            return False
+
+        entry_totals = {}
+        exit_totals = {}
+        coordinator = self._order_coordinator
+        orders = coordinator.orders() if coordinator is not None else []
+        for order in orders:
+            role = order.get("role")
+            if role not in ("ENTRY", "EXIT"):
+                continue
+            contract = order.get("contract", {})
+            key = self._contract_key(contract)
+            try:
+                quantity = int(order.get("filled_quantity", 0) or 0)
+            except (TypeError, ValueError, ArithmeticError):
+                return False
+            if quantity < 0:
+                return False
+            if key is None:
+                if quantity:
+                    return False
+                continue
+            underlying = contract.get("underlying_symbol")
+            symbol = str(contract.get("symbol", "")).upper()
+            if (underlying is not None and str(underlying).upper() != "SPY"):
+                if quantity:
+                    return False
+                continue
+            if underlying is None and not symbol.startswith("SPY"):
+                if quantity:
+                    return False
+                continue
+            target = entry_totals if role == "ENTRY" else exit_totals
+            target[key] = target.get(key, 0) + quantity
+
+        expected = {}
+        for key in set(entry_totals) | set(exit_totals):
+            bought = entry_totals.get(key, 0)
+            sold = exit_totals.get(key, 0)
+            if sold > bought:
+                return False
+            if bought > sold:
+                expected[key] = bought - sold
+
+        actual = {}
+        for position in positions:
+            instrument_type = getattr(position, "instrument_type", None)
+            if instrument_type not in ("EQUITY", "OPTION"):
+                return False
+            if instrument_type != "OPTION":
+                continue
+            legs = getattr(position, "legs", ())
+            if not isinstance(legs, (tuple, list)):
+                return False
+            position_symbol = str(getattr(position, "symbol", "")).upper()
+            leg_symbols = [str(getattr(leg, "symbol", "")).upper() for leg in legs]
+            is_spy_position = position_symbol.startswith("SPY") or any(
+                symbol.startswith("SPY") for symbol in leg_symbols
+            )
+            if not is_spy_position:
+                continue
+
+            contract, reason = self._emergency_position_contract(position)
+            if reason or contract["underlying_symbol"] != "SPY":
+                return False
+            key = self._contract_key({
+                "option_type": contract["option_type"],
+                "strike": contract["strike"],
+                "expiry": contract["expiry"],
+            })
+            if key is None:
+                return False
+            quantity = contract["quantity"]
+            actual[key] = actual.get(key, 0) + quantity
+        # Exact quantities reject unjournaled/manual SPY option holdings and
+        # ensure holdings agree with fill-derived quantities. Equity, buying
+        # power, prices, cost basis, and P/L are intentionally not compared.
+        return actual == expected
+
+===== strategy1_runner.py:599-609 [_emergency_close_account_positions] =====
+    def _emergency_close_account_positions(self, account_snapshot, account_data, coordinator):
+        """Serialize emergency passes so one account snapshot cannot fund two sells."""
+        if not self._emergency_liquidation_lock.acquire(blocking=False):
+            self._set_emergency_block("Another emergency liquidation pass is still reconciling.")
+            return
+        try:
+            self._emergency_close_account_positions_locked(
+                account_snapshot, account_data, coordinator
+            )
+        finally:
+            self._emergency_liquidation_lock.release()
+
+===== strategy1_runner.py:1164-1215 [_submit_live_exit] =====
+    def _submit_live_exit(self, direction, bid, reason):
+        with self._lock:
+            position = self.positions[direction]
+            # A terminal rejection must not strand a confirmed open position.
+            # submit_exit deduplicates active orders, so a later scan can make
+            # a fresh attempt for the remaining quantity after rejection.
+            if position is None:
+                return
+            if not self._account_positions_reconciled:
+                self._set_message(
+                    f"{direction}: automatic exit is paused until account position quantity is reconciled."
+                )
+                return
+            coordinator = self._order_coordinator
+            if coordinator is None:
+                return
+            position_key = position.get("entry_client_order_id")
+            contract = {
+                "symbol": position.get("symbol"),
+                "strike": position.get("strike"),
+                "expiry": position.get("expiry"),
+                "option_type": position.get("option_type", direction),
+            }
+            quantity = int(position["quantity"])
+        try:
+            record = coordinator.submit_exit(
+                position_key=position_key,
+                contract=contract,
+                direction=direction,
+                quantity=quantity,
+            )
+        except (OrderStateError, ValueError) as exc:
+            self._set_message(f"{direction}: real exit is unresolved ({type(exc).__name__}).")
+            return
+        with self._lock:
+            current = self.positions.get(direction)
+            if current and current.get("entry_client_order_id") == position_key:
+                current["exit_client_order_id"] = record.get("client_order_id")
+                current["status"] = f"EXIT {record.get('status', 'UNKNOWN')} — LIVE"
+        log_event(
+            "live_exit_order",
+            strategy="strategy1",
+            order_id=record.get("order_id"),
+            client_order_id=record.get("client_order_id"),
+            direction=direction,
+            reason=reason,
+            status=record.get("status"),
+            filled_quantity=record.get("filled_quantity"),
+            filled_price=record.get("filled_price"),
+            mode="live",
+        )
+        self._sync_live_positions(coordinator)
+
+===== order_execution.py:211-224 [begin_emergency_scan] =====
+    def begin_emergency_scan(self, emergency_id):
+        """Persist the account-order scan intent before listing broker orders."""
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        with self._lock:
+            current = self._emergency_scans.get(emergency_id, {})
+            self._emergency_scans[emergency_id] = {
+                "account_id": self.account_id,
+                "emergency_id": emergency_id,
+                "phase": "OPEN_ORDER_SCAN_REQUESTED",
+                "status": "UNRESOLVED",
+                "started_at": current.get("started_at") or datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
+
+===== order_execution.py:226-236 [finish_emergency_scan] =====
+    def finish_emergency_scan(self, emergency_id, *, status, phase="RECONCILED"):
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        with self._lock:
+            current = self._emergency_scans.get(emergency_id)
+            if not isinstance(current, dict) or current.get("account_id") != self.account_id:
+                raise OrderStateError("Emergency scan journal is unavailable.")
+            current["phase"] = str(phase)
+            current["status"] = str(status)
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save()
+
+===== order_execution.py:238-381 [journal_external_order] =====
+    def journal_external_order(self, open_order, *, emergency_id):
+        """Persist a discovered account order before querying or cancelling it."""
+        if not isinstance(open_order, dict):
+            raise OrderStateError("External order data is malformed.")
+        client_order_id = open_order.get("client_order_id")
+        if not isinstance(client_order_id, str) or not client_order_id:
+            raise OrderStateError("External order has no verifiable client order ID.")
+        if not isinstance(emergency_id, str) or not emergency_id:
+            raise OrderStateError("Emergency cycle identity is invalid.")
+        side = str(open_order.get("side", "")).upper()
+        intent = str(open_order.get("position_intent", "")).upper()
+        role = (
+            "ENTRY" if (side, intent) == ("BUY", "BUY_TO_OPEN") else
+            "EXIT" if (side, intent) == ("SELL", "SELL_TO_CLOSE") else
+            "EXTERNAL_UNKNOWN"
+        )
+        quantity = filled = None
+        contract = None
+        try:
+            raw_quantity = open_order.get("total_quantity", open_order.get("quantity"))
+            qty_decimal = _money(raw_quantity)
+            fill_decimal = _money(open_order.get("filled_quantity", open_order.get("filled_qty", 0)))
+            if (qty_decimal != qty_decimal.to_integral_value()
+                    or fill_decimal != fill_decimal.to_integral_value()):
+                raise ValueError
+            quantity, filled = int(qty_decimal), int(fill_decimal)
+            legs = open_order.get("legs")
+            if (quantity < 1 or filled < 0 or filled > quantity
+                    or not isinstance(legs, list) or len(legs) != 1
+                    or not isinstance(legs[0], dict)):
+                raise ValueError
+            leg = legs[0]
+            strike = _money(leg.get("strike_price"))
+            expiry = leg.get("option_expire_date")
+            option_type = str(leg.get("option_type", "")).upper()
+            underlying = str(open_order.get("symbol") or leg.get("symbol") or "").upper()
+            if (strike <= 0 or not isinstance(expiry, str) or not expiry
+                    or option_type not in ("CALL", "PUT") or not underlying.isalpha()):
+                raise ValueError
+            contract = {
+                "symbol": leg.get("symbol"), "strike": format(strike, "f"),
+                "expiry": expiry, "option_type": option_type,
+                "underlying_symbol": underlying,
+            }
+        except (TypeError, ValueError, ArithmeticError):
+            role = "EXTERNAL_UNKNOWN"
+
+        with self._lock:
+            existing = self._orders.get(client_order_id)
+            if existing is not None and existing.get("source") != "emergency_external":
+                raise OrderStateError("External order conflicts with a locally journaled order.")
+            if existing is not None:
+                same_identity = (
+                    existing.get("account_id") == self.account_id
+                    and existing.get("emergency_id") == emergency_id
+                    and existing.get("side") == side
+                    and existing.get("position_intent") == intent
+                    and existing.get("quantity") == quantity
+                    and existing.get("contract") == contract
+                )
+                if not same_identity:
+                    existing["status"] = "UNKNOWN"
+                    existing["reconciliation_conflict"] = True
+                    existing["emergency_phase"] = "IDENTITY_CONFLICT"
+                    self._update_quantity_tracking(existing)
+                    self._save()
+                    raise OrderStateError("External order identity changed during reconciliation.")
+                existing["emergency_phase"] = "DISCOVERED"
+                existing["order_id"] = open_order.get("order_id") or existing.get("order_id")
+                # The broker list may be stale. Preserve the highest confirmed
+                # cumulative fill and let the detail query apply monotonic checks.
+                existing["filled_quantity"] = max(
+                    int(existing.get("filled_quantity", 0) or 0), int(filled or 0)
+                )
+                if existing.get("status") not in TERMINAL_STATUSES:
+                    existing["status"] = _normalized_status(
+                        open_order.get("status", open_order.get("order_status"))
+                    )
+                self._update_quantity_tracking(existing)
+                record = existing
+            else:
+                position_key = "external:" + client_order_id
+                if role == "EXIT" and contract is not None:
+                    identity = (
+                        contract["underlying_symbol"],
+                        _money(contract["strike"]).normalize(),
+                        contract["expiry"], contract["option_type"],
+                    )
+                    candidates = []
+                    for entry in self._orders.values():
+                        if entry.get("role") != "ENTRY":
+                            continue
+                        entry_contract = entry.get("contract", {})
+                        try:
+                            entry_identity = (
+                                str(entry_contract.get("underlying_symbol", "SPY")).upper(),
+                                _money(entry_contract.get("strike")).normalize(),
+                                str(entry_contract.get("expiry", "")),
+                                str(entry_contract.get("option_type", "")).upper(),
+                            )
+                        except ValueError:
+                            continue
+                        if entry_identity != identity:
+                            continue
+                        exits = sum(
+                            int(item.get("filled_quantity", 0) or 0)
+                            for item in self._orders.values()
+                            if item.get("role") == "EXIT"
+                            and item.get("position_key") == entry.get("client_order_id")
+                        )
+                        remaining = int(entry.get("filled_quantity", 0) or 0) - exits
+                        if remaining > 0:
+                            candidates.append(entry)
+                    if len(candidates) == 1:
+                        position_key = candidates[0].get("client_order_id")
+                record = {
+                    "client_order_id": client_order_id,
+                    "order_id": open_order.get("order_id"),
+                    "account_id": self.account_id,
+                    "emergency_id": emergency_id,
+                    "emergency_phase": "DISCOVERED",
+                    "source": "emergency_external",
+                    "signal_key": None,
+                    "position_key": position_key,
+                    "role": role,
+                    "side": side,
+                    "position_intent": intent,
+                    "direction": contract.get("option_type") if contract else None,
+                    "contract": contract or {},
+                    "quantity": quantity,
+                    "filled_quantity": filled or 0,
+                    "filled_price": None,
+                    "status": _normalized_status(
+                        open_order.get("status", open_order.get("order_status"))
+                    ) if role != "EXTERNAL_UNKNOWN" else "UNKNOWN",
+                    "reconciliation_conflict": role == "EXTERNAL_UNKNOWN",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if role == "EXTERNAL_UNKNOWN":
+                    record["status"] = "UNKNOWN"
+                self._update_quantity_tracking(record)
+                self._orders[client_order_id] = record
+            self._save()
+            return dict(record)
+
+===== order_execution.py:393-432 [refresh_emergency_orders] =====
+    def refresh_emergency_orders(self, emergency_id):
+        """Re-query every journaled external order for the active batch."""
+        with self._lock:
+            ids = [
+                order["client_order_id"] for order in self._orders.values()
+                if order.get("source") == "emergency_external"
+                and order.get("emergency_id") == emergency_id
+            ]
+        refreshed = []
+        for client_order_id in ids:
+            self._set_external_order_phase(
+                client_order_id, emergency_id, "DETAIL_QUERY_REQUESTED"
+            )
+            with self._lock:
+                record = self._orders[client_order_id]
+            try:
+                detail = _payload(self.order_api.get_order_detail(
+                    self.account_id, client_order_id
+                ))
+                item = _order_item(detail)
+                with self._lock:
+                    record = self._orders[client_order_id]
+                    if item.get("client_order_id") not in (None, client_order_id):
+                        raise OrderStateError("Order detail belongs to a different order.")
+                    self._apply_detail(record, item)
+                    record["emergency_phase"] = (
+                        "UNRESOLVED" if record.get("reconciliation_conflict")
+                        or record.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                    )
+                    self._save()
+                    refreshed.append(dict(record))
+            except Exception:
+                with self._lock:
+                    record = self._orders[client_order_id]
+                    record["status"] = "UNKNOWN"
+                    record["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                    self._update_quantity_tracking(record)
+                    self._save()
+                refreshed.append(dict(record))
+        return refreshed
+
+===== order_execution.py:634-682 [submit_exit] =====
+    def submit_exit(self, *, position_key, contract, direction, quantity, price=None,
+                    underlying_symbol=None, source="strategy1",
+                    emergency_baseline_quantity=None, broker_covered_quantity=0):
+        with self._lock:
+            underlying_symbol = str(
+                underlying_symbol or contract.get("underlying_symbol") or "SPY"
+            ).upper()
+            base_key = (
+                underlying_symbol,
+                _money(contract.get("strike_price", contract.get("strike"))).normalize(),
+                str(contract.get("expiry", contract.get("option_expire_date", contract.get("expiration_date", "")))),
+                str(contract.get("option_type", direction)).upper(),
+            )
+            covered = 0
+            latest_active = None
+            for order in self._orders.values():
+                if order.get("role") != "EXIT" or order.get("status") not in ACTIVE_STATUSES:
+                    continue
+                order_contract = order.get("contract", {})
+                try:
+                    order_key = (
+                        str(order_contract.get("underlying_symbol", "SPY")).upper(),
+                        _money(order_contract.get("strike")).normalize(),
+                        str(order_contract.get("expiry", "")),
+                        str(order_contract.get("option_type", "")).upper(),
+                    )
+                except ValueError:
+                    continue
+                if order_key == base_key:
+                    covered += max(0, int(order.get("quantity", 0)) - int(order.get("filled_quantity", 0)))
+                    latest_active = order
+            broker_covered_quantity = int(broker_covered_quantity)
+            if broker_covered_quantity < 0:
+                raise OrderStateError("Covered closing quantity is invalid.")
+            covered += broker_covered_quantity
+            quantity_to_submit = max(0, int(quantity) - covered)
+            if quantity_to_submit == 0:
+                return dict(latest_active) if latest_active else {
+                    "status": "ALREADY_COVERED", "role": "EXIT",
+                    "position_key": position_key, "filled_quantity": 0,
+                }
+            return dict(self._submit(
+                signal_key=None, role="EXIT", direction=direction,
+                contract=contract, quantity=quantity_to_submit, price=None,
+                side="SELL", intent="SELL_TO_CLOSE", position_key=position_key,
+                order_type="MARKET", underlying_symbol=underlying_symbol,
+                source=source, emergency_baseline_quantity=emergency_baseline_quantity,
+                take_profit_pct=None, stop_loss_pct=None,
+            ))
+
+===== order_execution.py:893-935 [cancel_external] =====
+    def cancel_external(self, client_order_id):
+        """Cancel a previously journaled external order and query its outcome."""
+        with self._lock:
+            record = self._orders.get(client_order_id)
+            if (record is None or record.get("source") != "emergency_external"
+                    or record.get("account_id") != self.account_id):
+                raise OrderStateError("External order must be journaled before cancellation.")
+            emergency_id = record.get("emergency_id")
+        self._set_external_order_phase(client_order_id, emergency_id, "CANCEL_REQUESTED")
+        try:
+            self.order_api.cancel_order(self.account_id, client_order_id)
+            phase = "CANCEL_ACKNOWLEDGED"
+        except Exception:
+            phase = "CANCEL_REQUEST_UNKNOWN"
+        self._set_external_order_phase(client_order_id, emergency_id, phase)
+        self._set_external_order_phase(client_order_id, emergency_id, "DETAIL_QUERY_REQUESTED")
+        with self._lock:
+            try:
+                payload = _payload(self.order_api.get_order_detail(
+                    self.account_id, client_order_id
+                ))
+                item = _order_item(payload)
+                if item.get("client_order_id") not in (None, client_order_id):
+                    raise OrderStateError("Order detail belongs to a different order.")
+                record = self._orders[client_order_id]
+                self._apply_detail(record, item)
+                record["emergency_phase"] = (
+                    "UNRESOLVED" if record.get("reconciliation_conflict")
+                    or record.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                )
+                self._save()
+                if record.get("status") == "UNKNOWN":
+                    raise OrderStateError("External order cancellation is unresolved.")
+                return dict(record)
+            except OrderStateError:
+                raise
+            except Exception:
+                record = self._orders[client_order_id]
+                record["status"] = "UNKNOWN"
+                record["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                self._update_quantity_tracking(record)
+                self._save()
+                raise OrderStateError("External order cancellation is unresolved.") from None
+
+===== order_execution.py:937-971 [confirm_emergency_order] =====
+    def confirm_emergency_order(self, open_order, *, emergency_id):
+        """Journal an external order before its order-detail request."""
+        record = self.journal_external_order(open_order, emergency_id=emergency_id)
+        if record.get("role") == "EXTERNAL_UNKNOWN":
+            raise OrderStateError("External order cannot be safely identified.")
+        self._set_external_order_phase(
+            record["client_order_id"], emergency_id, "DETAIL_QUERY_REQUESTED"
+        )
+        with self._lock:
+            try:
+                payload = _payload(self.order_api.get_order_detail(
+                    self.account_id, record["client_order_id"]
+                ))
+                item = _order_item(payload)
+                if item.get("client_order_id") not in (None, record["client_order_id"]):
+                    raise OrderStateError("Order detail belongs to a different order.")
+                current = self._orders[record["client_order_id"]]
+                self._apply_detail(current, item)
+                current["emergency_phase"] = (
+                    "UNRESOLVED" if current.get("reconciliation_conflict")
+                    or current.get("status") == "UNKNOWN" else "DETAIL_CONFIRMED"
+                )
+                self._save()
+                if current.get("status") == "UNKNOWN":
+                    raise OrderStateError("External order detail is unresolved.")
+                return dict(current)
+            except OrderStateError:
+                raise
+            except Exception:
+                current = self._orders[record["client_order_id"]]
+                current["status"] = "UNKNOWN"
+                current["emergency_phase"] = "DETAIL_QUERY_UNRESOLVED"
+                self._update_quantity_tracking(current)
+                self._save()
+                raise OrderStateError("External order detail is unresolved.") from None
+
+===== RELEVANT TEST METHODS =====
+
+===== test_runner_start_does_not_reset_an_incomplete_emergency_stop lines 376-386 =====
+    def test_runner_start_does_not_reset_an_incomplete_emergency_stop(self):
+        self.runner._emergency = True
+        self.runner._emergency_account_flat = False
+        self.runner._emergency_unresolved = ["order unresolved"]
+        self.runner._accept_entries = False
+        with patch.object(self.runner, "_worker") as worker:
+            started = self.runner.start()
+        self.assertFalse(started)
+        self.assertTrue(self.runner._emergency)
+        self.assertFalse(self.runner._accept_entries)
+        worker.assert_not_called()
+
+===== test_buy_authorization_off_does_not_disable_existing_position_exit lines 388-410 =====
+    def test_buy_authorization_off_does_not_disable_existing_position_exit(self):
+        self.runner.real_trading_authorized = False
+        self.runner._order_coordinator = self.coordinator
+        self.coordinator._orders.append({
+            "client_order_id": "entry-call", "position_key": "entry-call",
+            "role": "ENTRY", "direction": "CALL",
+            "contract": {"symbol": self.contract["symbol"], "strike": "761",
+                         "expiry": "2026-11-05", "option_type": "CALL"},
+            "quantity": 1, "filled_quantity": 1, "filled_price": "2.00",
+            "limit_price": "2.10", "status": "FILLED",
+            "take_profit_pct": 5, "stop_loss_pct": 5,
+        })
+        self.runner._sync_live_positions(self.coordinator)
+        self.runner._engine = Mock()
+        self.runner._engine.get_option_snapshot.return_value = {
+            "bid": 2.10, "ask": 2.15, "quote_valid": True,
+        }
+
+        self.runner._manage_position("CALL", self.runner.positions["CALL"])
+
+        self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+        self.assertEqual(self.coordinator.exit_calls[-1]["price"], None)
+        self.assertIsNone(self.runner.positions["CALL"])
+
+===== test_emergency_stop_market_closes_actual_account_option_not_only_ledger lines 412-430 =====
+    def test_emergency_stop_market_closes_actual_account_option_not_only_ledger(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(2),)
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(),
+            self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+        call = self.coordinator.exit_calls[0]
+        self.assertEqual(call["quantity"], 2)
+        self.assertEqual(call["source"], "emergency_stop")
+        self.assertEqual(call["underlying_symbol"], "SPY")
+        self.assertEqual(self.coordinator.orders()[0]["order_type"], "MARKET")
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_emergency_stop_does_not_duplicate_covered_open_sell lines 432-458 =====
+    def test_emergency_stop_does_not_duplicate_covered_open_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "existing-sell", "symbol": "SPY",
+            "side": "SELL", "position_intent": "SELL_TO_CLOSE",
+            "quantity": "1", "filled_quantity": "0", "status": "SUBMITTED",
+            "legs": [{
+                "symbol": "SPY", "strike_price": "761",
+                "option_expire_date": "2026-11-05", "option_type": "CALL",
+            }],
+        }]
+        self.coordinator.confirmed_orders["existing-sell"] = {
+            "client_order_id": "existing-sell", "status": "SUBMITTED",
+            "total_quantity": "1", "filled_quantity": "0",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(),
+            self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders lines 460-472 =====
+    def test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = ()
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertTrue(self.runner._emergency_account_flat)
+        self.assertEqual(self.runner._emergency_unresolved, [])
+
+===== test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat lines 474-490 =====
+    def test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (
+            SimpleNamespace(instrument_type="EQUITY", symbol="XYZ"),
+        )
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(),
+            self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertFalse(self.runner._emergency_account_flat)
+        self.assertIn("unsupported non-option position", self.runner._emergency_unresolved)
+        self.assertEqual(self.coordinator.exit_calls, [])
+
+===== test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell lines 492-519 =====
+    def test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(2),)
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+
+        # The same pre-order account response cannot authorize another sell.
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+
+        # A later response that still conflicts with the confirmed fill also
+        # blocks a duplicate market sell.
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+        self.assertTrue(self.runner._emergency_unresolved)
+
+===== test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh lines 521-543 =====
+    def test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "open-buy", "side": "BUY",
+            "position_intent": "BUY_TO_OPEN", "status": "SUBMITTED",
+        }]
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.cancel_external_calls, ["open-buy"])
+        self.assertEqual(self.coordinator.exit_calls, [])
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+
+===== test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger lines 545-584 =====
+    def test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "cancel-race"
+        open_buy = {
+            "client_order_id": "external-buy-partial", "symbol": "SPY",
+            "side": "BUY", "position_intent": "BUY_TO_OPEN",
+            "quantity": "2", "status": "SUBMITTED",
+            "legs": [{
+                "symbol": "SPY", "side": "BUY", "quantity": "2",
+                "strike_price": "761", "option_expire_date": "2026-11-05",
+                "option_type": "CALL", "instrument_type": "OPTION",
+            }],
+        }
+        self.coordinator.broker_open_orders = [open_buy]
+        self.coordinator.external_cancel_results["external-buy-partial"] = {
+            "client_order_id": "external-buy-partial", "status": "CANCELLED",
+            "total_quantity": "2", "filled_quantity": "1", "filled_price": "2.00",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.cancel_external_calls, ["external-buy-partial"])
+        self.assertEqual(self.coordinator.external_entry_states[0]["filled_quantity"], "1")
+        self.assertEqual(self.coordinator.exit_calls, [])
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(len(self.coordinator.exit_calls), 1)
+        self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 1)
+        self.assertEqual(self.coordinator.exit_calls[0]["request"]["order_type"], "MARKET")
+        self.assertEqual(self.coordinator.exit_calls[0]["request"]["position_intent"], "SELL_TO_CLOSE")
+        self.assertNotIn("limit_price", self.coordinator.exit_calls[0]["request"])
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result lines 586-617 =====
+    def test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "buy-fill-race"
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "external-buy-filled", "symbol": "SPY",
+            "side": "BUY", "position_intent": "BUY_TO_OPEN", "quantity": "2",
+            "status": "SUBMITTED",
+            "legs": [{
+                "symbol": "SPY", "side": "BUY", "quantity": "2",
+                "strike_price": "761", "option_expire_date": "2026-11-05",
+                "option_type": "CALL", "instrument_type": "OPTION",
+            }],
+        }]
+        self.coordinator.external_cancel_results["external-buy-filled"] = {
+            "client_order_id": "external-buy-filled", "status": "FILLED",
+            "total_quantity": "2", "filled_quantity": "2", "filled_price": "2.00",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.external_entry_states[0]["status"], "FILLED")
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 2)
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_stale_account_quantity_cannot_override_confirmed_buy_quantity lines 650-672 =====
+    def test_stale_account_quantity_cannot_override_confirmed_buy_quantity(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "old-account-quantity"
+        self.coordinator._orders.append({
+            "client_order_id": "confirmed-buy-2", "role": "ENTRY",
+            "direction": "CALL", "contract": {
+                "underlying_symbol": "SPY", "strike": "761",
+                "expiry": "2026-11-05", "option_type": "CALL",
+            },
+            "quantity": 2, "filled_quantity": 2, "filled_price": "2.00",
+            "cancelled_quantity": 0, "unresolved_quantity": 0,
+            "status": "FILLED",
+        })
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 2)
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_stale_position_snapshot_after_partial_sell_does_not_submit_another_sell lines 674-700 =====
+    def test_stale_position_snapshot_after_partial_sell_does_not_submit_another_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.runner._emergency_id = "partial-sell-stale-position"
+        contract = {
+            "underlying_symbol": "SPY", "strike": "761",
+            "expiry": "2026-11-05", "option_type": "CALL",
+        }
+        self.coordinator._orders.extend([
+            {"client_order_id": "buy-2", "role": "ENTRY", "direction": "CALL",
+             "contract": contract, "quantity": 2, "filled_quantity": 2,
+             "filled_price": "2.00", "status": "FILLED"},
+            {"client_order_id": "sell-partial", "role": "EXIT", "direction": "CALL",
+             "contract": contract, "quantity": 2, "filled_quantity": 1,
+             "filled_price": "1.90", "status": "PARTIALLY_FILLED"},
+        ])
+        self.account_monitor.account_data.positions = (self.account_option_position(2),)
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertFalse(self.runner._emergency_account_flat)
+        self.assertTrue(self.runner._emergency_unresolved)
+
+===== test_unknown_sell_status_blocks_duplicate_emergency_sell lines 702-725 =====
+    def test_unknown_sell_status_blocks_duplicate_emergency_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.coordinator._orders.extend([
+            {"client_order_id": "buy-known", "role": "ENTRY", "direction": "CALL",
+             "contract": {"underlying_symbol": "SPY", "strike": "761",
+                          "expiry": "2026-11-05", "option_type": "CALL"},
+             "quantity": 2, "filled_quantity": 2, "filled_price": "2.00", "status": "FILLED"},
+            {"client_order_id": "sell-unknown", "role": "EXIT", "direction": "CALL",
+             "contract": {"underlying_symbol": "SPY", "strike": "761",
+                          "expiry": "2026-11-05", "option_type": "CALL"},
+             "quantity": 2, "filled_quantity": 0, "status": "UNKNOWN"},
+        ])
+        self.account_monitor.account_data.positions = (self.account_option_position(2),)
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertFalse(self.runner._emergency_account_flat)
+        self.assertTrue(self.runner._emergency_unresolved)
+
+===== test_concurrent_emergency_passes_cannot_use_the_same_position_twice lines 788-815 =====
+    def test_concurrent_emergency_passes_cannot_use_the_same_position_twice(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingCoordinator(FakeCoordinator):
+            def list_open_orders(inner_self):
+                entered.set()
+                release.wait(timeout=2)
+                return super(BlockingCoordinator, inner_self).list_open_orders()
+
+        coordinator = BlockingCoordinator()
+        self.runner._order_coordinator = coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        first = threading.Thread(target=self.runner._emergency_close_account_positions,
+                                 args=(self.account_monitor.get_snapshot(),
+                                       self.account_monitor.account_data, coordinator))
+        first.start()
+        self.assertTrue(entered.wait(timeout=2))
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            coordinator,
+        )
+        release.set()
+        first.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(len(coordinator.exit_calls), 1)
+
+===== test_emergency_stop_fails_closed_on_stale_account_snapshot lines 817-830 =====
+    def test_emergency_stop_fails_closed_on_stale_account_snapshot(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.account_monitor.snapshot_is_fresh = lambda: False
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertFalse(self.runner._emergency_account_flat)
+
+===== test_emergency_stop_does_not_repeat_an_external_filled_sell lines 832-870 =====
+    def test_emergency_stop_does_not_repeat_an_external_filled_sell(self):
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.runner._emergency = True
+        self.account_monitor.account_data.positions = (self.account_option_position(1),)
+        self.coordinator.broker_open_orders = [{
+            "client_order_id": "external-sell", "symbol": "SPY",
+            "side": "SELL", "position_intent": "SELL_TO_CLOSE",
+            "quantity": "1", "filled_quantity": "1", "status": "FILLED",
+            "legs": [{
+                "symbol": "SPY", "strike_price": "761",
+                "option_expire_date": "2026-11-05", "option_type": "CALL",
+            }],
+        }]
+        self.coordinator.confirmed_orders["external-sell"] = {
+            "client_order_id": "external-sell", "status": "FILLED",
+            "total_quantity": "1", "filled_quantity": "1",
+        }
+
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertEqual(
+            self.coordinator.emergency_baselines[
+                f"{self.runner._emergency_id}|SPY|761|2026-11-05|CALL"
+            ]
+            ["external_exit_fills"]["external-sell"],
+            1,
+        )
+
+        self.account_monitor.polled_at_monotonic = 102
+        self.runner._emergency_close_account_positions(
+            self.account_monitor.get_snapshot(), self.account_monitor.account_data,
+            self.coordinator,
+        )
+        self.assertEqual(self.coordinator.exit_calls, [])
+        self.assertTrue(self.runner._emergency_unresolved)
+
+===== test_rejected_exit_does_not_strand_confirmed_position lines 920-951 =====
+    def test_rejected_exit_does_not_strand_confirmed_position(self):
+        self.runner._order_coordinator = self.coordinator
+        self.coordinator._orders.extend([
+            {
+                "client_order_id": "entry-call", "position_key": "entry-call",
+                "role": "ENTRY", "direction": "CALL",
+                "contract": {"symbol": self.contract["symbol"], "strike": "761",
+                             "expiry": "2026-11-05", "option_type": "CALL"},
+                "quantity": 1, "filled_quantity": 1, "filled_price": "2.00",
+                "limit_price": "2.10", "status": "FILLED",
+                "take_profit_pct": 5, "stop_loss_pct": 5,
+            },
+            {
+                "client_order_id": "rejected-exit", "position_key": "entry-call",
+                "role": "EXIT", "direction": "CALL", "quantity": 1,
+                "filled_quantity": 0, "status": "REJECTED",
+            },
+        ])
+        self.runner._sync_live_positions(self.coordinator)
+        self.assertIsNotNone(self.runner.positions["CALL"])
+        self.assertEqual(self.runner.positions["CALL"]["status"], "EXIT REJECTED — RETRYING")
+
+        self.runner._engine = Mock()
+        self.runner._engine.get_option_snapshot.return_value = {
+            "bid": 1.80, "ask": 1.85, "quote_valid": True,
+        }
+        self.runner._emergency = True
+        self.runner._manage_position("CALL", self.runner.positions["CALL"])
+
+        self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+        self.assertEqual(self.coordinator.orders()[-1]["status"], "FILLED")
+        self.assertIsNone(self.runner.positions["CALL"])
+
+===== test_partial_sell_keeps_only_the_unclosed_filled_quantity lines 953-979 =====
+    def test_partial_sell_keeps_only_the_unclosed_filled_quantity(self):
+        self.runner._order_coordinator = self.coordinator
+        self.coordinator._orders.extend([
+            {
+                "client_order_id": "entry-call", "position_key": "entry-call",
+                "role": "ENTRY", "direction": "CALL",
+                "contract": {"symbol": self.contract["symbol"], "strike": "761",
+                             "expiry": "2026-11-05", "option_type": "CALL"},
+                "quantity": 2, "filled_quantity": 2, "filled_price": "2.00",
+                "limit_price": "2.10", "status": "FILLED",
+                "take_profit_pct": 5, "stop_loss_pct": 5,
+            },
+            {
+                "client_order_id": "partial-exit", "position_key": "entry-call",
+                "role": "EXIT", "direction": "CALL", "quantity": 2,
+                "filled_quantity": 1, "filled_price": "2.10",
+                "status": "PARTIALLY_FILLED",
+            },
+        ])
+
+        self.runner._sync_live_positions(self.coordinator)
+
+        self.assertEqual(self.runner.positions["CALL"]["quantity"], 1)
+        self.assertEqual(
+            self.runner.positions["CALL"]["status"],
+            "EXIT PARTIALLY_FILLED — LIVE",
+        )
+
+===== test_account_monitor_failure_does_not_stop_existing_live_exit_management lines 1025-1051 =====
+    def test_account_monitor_failure_does_not_stop_existing_live_exit_management(self):
+        self.account_monitor.allowed = False
+        self.runner._order_coordinator = self.coordinator
+        self.runner._order_account_id = "OFFLINE-MARGIN"
+        self.coordinator._orders.append({
+            "client_order_id": "entry-put", "order_id": "entry-order-put",
+            "signal_key": "signal-put", "position_key": "entry-put",
+            "role": "ENTRY", "direction": "PUT",
+            "contract": {"symbol": "SPY261105P00759000", "strike": "759",
+                         "expiry": "2026-11-05", "option_type": "PUT"},
+            "quantity": 1, "filled_quantity": 1, "filled_price": "2.00",
+            "limit_price": "2.10", "status": "FILLED",
+            "take_profit_pct": 5, "stop_loss_pct": 5,
+        })
+        self.runner._sync_live_positions(self.coordinator)
+        self.runner._engine = Mock()
+        self.runner._engine.get_market_snapshot.return_value = {"entry_data_valid": True}
+        self.runner._engine.get_option_snapshot.return_value = {
+            "bid": 1.90, "ask": 1.95, "quote_valid": True,
+        }
+        self.runner._accept_entries = True
+
+        self.runner.run_once()
+
+        self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+        self.assertIsNone(self.runner.positions["PUT"])
+        self.runner._engine.get_nearest_otm_option_snapshot.assert_not_called()
+
+===== EXISTING TEST RESULTS =====
+test_account_monitor_failure_does_not_stop_existing_live_exit_management (test_strategy1_runner.TestStrategy1Runner.test_account_monitor_failure_does_not_stop_existing_live_exit_management) ... FAIL
+test_amount_differences_do_not_fail_matching_position_reconciliation (test_strategy1_runner.TestStrategy1Runner.test_amount_differences_do_not_fail_matching_position_reconciliation) ... ok
+test_buy_authorization_off_does_not_disable_existing_position_exit (test_strategy1_runner.TestStrategy1Runner.test_buy_authorization_off_does_not_disable_existing_position_exit) ... FAIL
+test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result (test_strategy1_runner.TestStrategy1Runner.test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result) ... ERROR
+test_buy_signal_uses_cached_account_snapshot_and_never_reads_account_api (test_strategy1_runner.TestStrategy1Runner.test_buy_signal_uses_cached_account_snapshot_and_never_reads_account_api) ... ok
+test_concurrent_emergency_passes_cannot_use_the_same_position_twice (test_strategy1_runner.TestStrategy1Runner.test_concurrent_emergency_passes_cannot_use_the_same_position_twice) ... FAIL
+test_confirmed_buy_with_empty_account_snapshot_is_not_missed (test_strategy1_runner.TestStrategy1Runner.test_confirmed_buy_with_empty_account_snapshot_is_not_missed) ... ERROR
+test_default_runner_start_does_not_authorize_real_buys (test_strategy1_runner.TestStrategy1Runner.test_default_runner_start_does_not_authorize_real_buys) ... ok
+test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh) ... FAIL
+test_emergency_stop_does_not_duplicate_covered_open_sell (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_does_not_duplicate_covered_open_sell) ... ok
+test_emergency_stop_does_not_repeat_an_external_filled_sell (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_does_not_repeat_an_external_filled_sell) ... ERROR
+test_emergency_stop_fails_closed_on_stale_account_snapshot (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_fails_closed_on_stale_account_snapshot) ... ok
+test_emergency_stop_market_closes_actual_account_option_not_only_ledger (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_market_closes_actual_account_option_not_only_ledger) ... FAIL
+test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders) ... FAIL
+test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat) ... FAIL
+test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell) ... FAIL
+test_filled_buy_creates_live_position_from_actual_fill (test_strategy1_runner.TestStrategy1Runner.test_filled_buy_creates_live_position_from_actual_fill) ... ok
+test_low_budget_and_low_option_power_reject_new_entry (test_strategy1_runner.TestStrategy1Runner.test_low_budget_and_low_option_power_reject_new_entry) ... ok
+test_old_account_quantity_after_fully_filled_sell_cannot_trigger_another_sell (test_strategy1_runner.TestStrategy1Runner.test_old_account_quantity_after_fully_filled_sell_cannot_trigger_another_sell) ... ok
+test_option_contract_mismatches_fail_reconciliation (test_strategy1_runner.TestStrategy1Runner.test_option_contract_mismatches_fail_reconciliation) ... ok
+test_ordinary_stop_keeps_managing_open_live_position (test_strategy1_runner.TestStrategy1Runner.test_ordinary_stop_keeps_managing_open_live_position) ... ok
+test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger (test_strategy1_runner.TestStrategy1Runner.test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger) ... FAIL
+test_partial_sell_keeps_only_the_unclosed_filled_quantity (test_strategy1_runner.TestStrategy1Runner.test_partial_sell_keeps_only_the_unclosed_filled_quantity) ... ok
+test_position_quantity_mismatch_fails_reconciliation (test_strategy1_runner.TestStrategy1Runner.test_position_quantity_mismatch_fails_reconciliation) ... ok
+test_rejected_exit_does_not_strand_confirmed_position (test_strategy1_runner.TestStrategy1Runner.test_rejected_exit_does_not_strand_confirmed_position) ... FAIL
+test_runner_start_does_not_reset_an_incomplete_emergency_stop (test_strategy1_runner.TestStrategy1Runner.test_runner_start_does_not_reset_an_incomplete_emergency_stop) ... ok
+test_stale_account_quantity_cannot_override_confirmed_buy_quantity (test_strategy1_runner.TestStrategy1Runner.test_stale_account_quantity_cannot_override_confirmed_buy_quantity) ... ERROR
+test_stale_position_snapshot_after_partial_sell_does_not_submit_another_sell (test_strategy1_runner.TestStrategy1Runner.test_stale_position_snapshot_after_partial_sell_does_not_submit_another_sell) ... ok
+test_take_profit_submits_real_sell_to_close_and_waits_for_fill (test_strategy1_runner.TestStrategy1Runner.test_take_profit_submits_real_sell_to_close_and_waits_for_fill) ... FAIL
+test_unknown_sell_status_blocks_duplicate_emergency_sell (test_strategy1_runner.TestStrategy1Runner.test_unknown_sell_status_blocks_duplicate_emergency_sell) ... ok
+test_unparseable_spy_position_or_overclosed_ledger_fails_reconciliation (test_strategy1_runner.TestStrategy1Runner.test_unparseable_spy_position_or_overclosed_ledger_fails_reconciliation) ... ok
+test_unreconciled_confirmed_sell_fill_cannot_be_reported_flat (test_strategy1_runner.TestStrategy1Runner.test_unreconciled_confirmed_sell_fill_cannot_be_reported_flat) ... ok
+
+======================================================================
+ERROR: test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result (test_strategy1_runner.TestStrategy1Runner.test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 610, in test_buy_cancel_that_races_to_filled_state_is_counted_before_any_flat_result
+    self.assertEqual(self.coordinator.external_entry_states[0]["status"], "FILLED")
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+======================================================================
+ERROR: test_confirmed_buy_with_empty_account_snapshot_is_not_missed (test_strategy1_runner.TestStrategy1Runner.test_confirmed_buy_with_empty_account_snapshot_is_not_missed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 640, in test_confirmed_buy_with_empty_account_snapshot_is_not_missed
+    self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 2)
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+======================================================================
+ERROR: test_emergency_stop_does_not_repeat_an_external_filled_sell (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_does_not_repeat_an_external_filled_sell)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 857, in test_emergency_stop_does_not_repeat_an_external_filled_sell
+    self.coordinator.emergency_baselines[
+KeyError: 'None|SPY|761|2026-11-05|CALL'
+
+======================================================================
+ERROR: test_stale_account_quantity_cannot_override_confirmed_buy_quantity (test_strategy1_runner.TestStrategy1Runner.test_stale_account_quantity_cannot_override_confirmed_buy_quantity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 671, in test_stale_account_quantity_cannot_override_confirmed_buy_quantity
+    self.assertEqual(self.coordinator.exit_calls[0]["quantity"], 2)
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+======================================================================
+FAIL: test_account_monitor_failure_does_not_stop_existing_live_exit_management (test_strategy1_runner.TestStrategy1Runner.test_account_monitor_failure_does_not_stop_existing_live_exit_management)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 1049, in test_account_monitor_failure_does_not_stop_existing_live_exit_management
+    self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+AssertionError: 'ENTRY' != 'EXIT'
+- ENTRY
++ EXIT
+
+
+======================================================================
+FAIL: test_buy_authorization_off_does_not_disable_existing_position_exit (test_strategy1_runner.TestStrategy1Runner.test_buy_authorization_off_does_not_disable_existing_position_exit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 408, in test_buy_authorization_off_does_not_disable_existing_position_exit
+    self.assertEqual(self.coordinator.orders()[-1]["role"], "EXIT")
+AssertionError: 'ENTRY' != 'EXIT'
+- ENTRY
++ EXIT
+
+
+======================================================================
+FAIL: test_concurrent_emergency_passes_cannot_use_the_same_position_twice (test_strategy1_runner.TestStrategy1Runner.test_concurrent_emergency_passes_cannot_use_the_same_position_twice)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 807, in test_concurrent_emergency_passes_cannot_use_the_same_position_twice
+    self.assertTrue(entered.wait(timeout=2))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 535, in test_emergency_stop_cancels_account_opening_order_then_waits_to_refresh
+    self.assertEqual(self.coordinator.cancel_external_calls, ["open-buy"])
+AssertionError: Lists differ: [] != ['open-buy']
+
+Second list contains 1 additional elements.
+First extra element 0:
+'open-buy'
+
+- []
++ ['open-buy']
+
+======================================================================
+FAIL: test_emergency_stop_market_closes_actual_account_option_not_only_ledger (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_market_closes_actual_account_option_not_only_ledger)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 424, in test_emergency_stop_market_closes_actual_account_option_not_only_ledger
+    self.assertEqual(len(self.coordinator.exit_calls), 1)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 471, in test_emergency_stop_reports_flat_only_after_empty_fresh_account_and_orders
+    self.assertTrue(self.runner._emergency_account_flat)
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 489, in test_emergency_stop_reports_unsupported_equity_and_does_not_claim_flat
+    self.assertIn("unsupported non-option position", self.runner._emergency_unresolved)
+AssertionError: 'unsupported non-option position' not found in ['The persisted emergency batch identity is unavailable.']
+
+======================================================================
+FAIL: test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell (test_strategy1_runner.TestStrategy1Runner.test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 502, in test_emergency_stop_waits_for_new_account_response_and_never_repeats_filled_sell
+    self.assertEqual(len(self.coordinator.exit_calls), 1)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger (test_strategy1_runner.TestStrategy1Runner.test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 570, in test_partial_buy_cancel_fill_is_persisted_and_liquidated_from_the_ledger
+    self.assertEqual(self.coordinator.cancel_external_calls, ["external-buy-partial"])
+AssertionError: Lists differ: [] != ['external-buy-partial']
+
+Second list contains 1 additional elements.
+First extra element 0:
+'external-buy-partial'
+
+- []
++ ['external-buy-partial']
+
+======================================================================
+FAIL: test_rejected_exit_does_not_strand_confirmed_position (test_strategy1_runner.TestStrategy1Runner.test_rejected_exit_does_not_strand_confirmed_position)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 950, in test_rejected_exit_does_not_strand_confirmed_position
+    self.assertEqual(self.coordinator.orders()[-1]["status"], "FILLED")
+AssertionError: 'REJECTED' != 'FILLED'
+- REJECTED
++ FILLED
+
+
+======================================================================
+FAIL: test_take_profit_submits_real_sell_to_close_and_waits_for_fill (test_strategy1_runner.TestStrategy1Runner.test_take_profit_submits_real_sell_to_close_and_waits_for_fill)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.12/3.12.15_1/Frameworks/Python.framework/Versions/3.12/lib/python3.12/unittest/mock.py", line 1396, in patched
+    return func(*newargs, **newkeywargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/racheldi/spy-trading-bot-review-sync/tests/test_strategy1_runner.py", line 916, in test_take_profit_submits_real_sell_to_close_and_waits_for_fill
+    self.assertEqual(exit_order["role"], "EXIT")
+AssertionError: 'ENTRY' != 'EXIT'
+- ENTRY
++ EXIT
+
+
+----------------------------------------------------------------------
+Ran 32 tests in 2.032s
+
+FAILED (failures=11, errors=4)
+TEST EXIT CODE: 1
