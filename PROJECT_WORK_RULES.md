@@ -56,13 +56,13 @@
 
 ## 5. GitHub 协作
 
-仓库：`orithecat/spy-trading-bot-review`
+仓库：`orithecat/spy-trading-bot`
 
-Review 分支：`diagnostics/strategy1-review-20261105`
+唯一基准分支：`main`（`origin/main`）
 
-主项目：`~/spy-trading-bot`
+本地项目：`~/spy-trading-bot`
 
-Review clone：`~/spy-trading-bot-review-sync`
+其他 review 仓库或分支仅作历史参考；除非用户明确指定，不得作为当前代码基准。
 
 虚拟环境：`~/spy-trading-bot/.venv`
 
