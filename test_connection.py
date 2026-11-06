@@ -1,80 +1,62 @@
+"""Read-only Webull US account connection and data validation."""
+
 import logging
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-logging.disable(logging.CRITICAL)
-load_dotenv()
+from account_data import fetch_margin_account_data
 
-app_key = os.getenv("WEBULL_APP_KEY")
-app_secret = os.getenv("WEBULL_APP_SECRET")
 
-if not app_key or not app_secret:
-    print("FAILED: .env credentials are missing")
-    raise SystemExit(1)
+def main():
+    logging.disable(logging.CRITICAL)
 
-try:
-    from webull.core.client import ApiClient
-    from webull.trade.trade_client import TradeClient
+    project_dir = Path(__file__).resolve().parent
+    load_dotenv(project_dir / ".env")
 
-    print("Initializing Webull client...")
-    client = ApiClient(
-        app_key,
-        app_secret,
-        "us",
-        connect_timeout=5,
-        timeout=10,
-        token_check_duration_seconds=20,
-        token_check_interval_seconds=2,
-    )
-    trade = TradeClient(client)
+    app_key = os.getenv("WEBULL_APP_KEY")
+    app_secret = os.getenv("WEBULL_APP_SECRET")
 
-    print("Requesting account list (read-only)...")
-    response = trade.account_v2.get_account_list()
+    if not app_key or not app_secret:
+        print("FAILED: Webull credentials are unavailable.")
+        return 1
 
-    print("\n========== ACCOUNT LIST RAW RESPONSE ==========")
-    print(response.text)
-    print("HTTP status:", response.status_code)
+    try:
+        from webull.core.client import ApiClient
+        from webull.trade.trade_client import TradeClient
 
-    if response.status_code != 200:
-        raise RuntimeError("Account query failed")
+        client = ApiClient(
+            app_key,
+            app_secret,
+            "us",
+            connect_timeout=5,
+            timeout=10,
+            token_check_duration_seconds=20,
+            token_check_interval_seconds=2,
+        )
+        trade = TradeClient(client)
 
-    accounts = response.json()
-    print("Account entries:", len(accounts))
+        print("Webull client initialized.")
+        print("Reading and validating account data (read-only)...")
 
-    margin_account = next(
-        (a for a in accounts if a.get("account_type") == "MARGIN"), None
-    )
+        account = fetch_margin_account_data(trade.account_v2)
 
-    if not margin_account:
-        raise RuntimeError("MARGIN account not found")
+        print("SUCCESS: exactly one MARGIN account verified.")
+        print("Account type:", account.account_type)
+        print("Currency:", account.currency)
+        print("Equity:", account.equity)
+        print("Option buying power:", account.option_buying_power)
+        print("Positions parsed:", len(account.positions))
+        print("Positions complete:", account.positions_complete)
+        print("No orders were submitted.")
+        return 0
 
-    margin_id = margin_account["account_id"]
+    except Exception as exc:
+        print("FAILED:", type(exc).__name__)
+        print("Account data could not be verified. Details suppressed.")
+        return 1
 
-    print("\n========== MARGIN ACCOUNT BALANCE ==========")
-    balance = trade.account_v2.get_account_balance(margin_id)
-    print(balance.text)
 
-    print("\n========== MARGIN ACCOUNT POSITIONS ==========")
-    positions = trade.account_v2.get_account_position(margin_id)
-    print(positions.text)
-
-    print("HTTP status:", response.status_code)
-
-    if response.status_code == 200:
-        try:
-            data = response.json()
-            print("JSON response: valid")
-            if isinstance(data, list):
-                print("Account entries:", len(data))
-            elif isinstance(data, dict):
-                print("Response structure: object")
-            else:
-                print("Response structure:", type(data).__name__)
-        except Exception:
-            print("Response received, but JSON parsing failed")
-    else:
-        print("Account query did not succeed; check API permissions.")
-
-except Exception as exc:
-    print("Connection test failed:", type(exc).__name__)
-    print("Details suppressed to protect credentials and account data.")
+if __name__ == "__main__":
+    raise SystemExit(main())
