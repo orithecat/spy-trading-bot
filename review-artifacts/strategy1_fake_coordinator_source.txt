@@ -1,0 +1,101 @@
+14:class FakeCoordinator:
+15-    def __init__(self, *_args, **_kwargs):
+16-        self._orders = []
+17-        self.submit_calls = []
+18-        self.cancel_calls = []
+19-        self.exit_calls = []
+20-        self.broker_open_orders = []
+21-        self.confirmed_orders = {}
+22-        self.emergency_baselines = {}
+23-        self.cancel_external_calls = []
+24-        self.external_entry_states = []
+25-        self.reconciliation_states = {}
+26-        self.external_cancel_results = {}
+27-
+28-    def orders(self):
+29-        return [dict(order) for order in self._orders]
+30-
+31-    def active_orders(self, role=None):
+32-        terminal = {"FILLED", "CANCELLED", "REJECTED"}
+33-        return [dict(order) for order in self._orders
+34-                if order["status"] not in terminal and (role is None or order["role"] == role)]
+35-
+36-    def refresh_active(self):
+37-        return []
+38-
+39-    def has_unknown_order(self):
+40-        return any(order["status"] == "UNKNOWN" for order in self._orders)
+41-
+42-    def submit_entry(self, *, signal_key, contract, direction, price,
+43-                     max_trade_amount, allocated_amount, option_buying_power,
+44-                     take_profit_pct, stop_loss_pct):
+45-        quantity = min(
+46-            int((float(max_trade_amount) - float(allocated_amount)) // (float(price) * 100)),
+47-            int(float(option_buying_power) // (float(price) * 100)),
+48-        )
+49-        if quantity < 1:
+50-            raise ValueError("budget insufficient")
+51-        self.submit_calls.append((signal_key, contract, direction, price))
+52-        order = {
+53-            "client_order_id": f"entry-{len(self.submit_calls)}",
+54-            "order_id": f"order-{len(self.submit_calls)}",
+55-            "signal_key": signal_key,
+56-            "position_key": f"entry-{len(self.submit_calls)}",
+57-            "role": "ENTRY",
+58-            "direction": direction,
+59-            "contract": {
+60-                "symbol": contract["symbol"],
+61-                "strike": str(contract.get("strike_price", contract.get("strike"))),
+62-                "expiry": contract.get("expiration_date", contract.get("expiry")),
+63-                "option_type": direction,
+64-            },
+65-            "quantity": quantity,
+66-            "filled_quantity": quantity,
+67-            "filled_price": str(float(price) - 0.02),
+68-            "limit_price": str(price),
+69-            "status": "FILLED",
+70-            "take_profit_pct": take_profit_pct,
+71-            "stop_loss_pct": stop_loss_pct,
+72-            "created_at": "2026-11-05T18:00:00+00:00",
+73-        }
+74-        self._orders.append(order)
+75-        return dict(order)
+76-
+77-    def list_open_orders(self):
+78-        return [dict(order) for order in self.broker_open_orders]
+79-
+80-    def confirm_order(self, client_order_id):
+81-        return dict(self.confirmed_orders[client_order_id])
+82-
+83-    def get_or_create_emergency_baseline(self, contract_key, quantity, *, emergency_id):
+84-        key = emergency_id + "|" + "|".join(str(value) for value in contract_key)
+85-        entry_filled = 0
+86-        exit_filled = 0
+87-        for order in self._orders:
+88-            contract = order.get("contract", {})
+89-            identity = (
+90-                str(contract.get("underlying_symbol", "SPY")).upper(),
+91-                Decimal(str(contract.get("strike"))).normalize(),
+92-                str(contract.get("expiry")),
+93-                str(contract.get("option_type", "")).upper(),
+94-            )
+95-            expected = (
+96-                str(contract_key[0]).upper(), Decimal(str(contract_key[1])).normalize(),
+97-                str(contract_key[2]), str(contract_key[3]).upper(),
+98-            )
+99-            if identity == expected:
+100-                if order.get("role") == "ENTRY":
+101-                    entry_filled += int(order.get("filled_quantity", 0))
+102-                elif order.get("role") == "EXIT":
+103-                    exit_filled += int(order.get("filled_quantity", 0))
+104-        return self.emergency_baselines.setdefault(
+105-            key, {"quantity": quantity, "entry_filled": entry_filled,
+106-                  "exit_filled": exit_filled,
+107-                  "ledger_open_quantity": entry_filled - exit_filled,
+108-                  "external_exit_fills": {}}
+109-        )
+110-
+111-    def record_emergency_external_entry(self, open_order, detail):
+112-        record = dict(open_order)
+113-        record.update(detail)
+114-        self.external_entry_states.append(record)
